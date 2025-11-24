@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
     let reg = WorkerRegistration {
         id: Uuid::nil(), // lo genera el master si viene nil
         host: "127.0.0.1".into(),
-        port: 9000, // luego usarás esto para recibir tareas
+        port: 9000, // esto para recibir tareas
     };
 
     let res = client
@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let hb = Heartbeat {
             worker_id,
-            num_active_tasks: 0, // luego pondrás el real
+            num_active_tasks: 0, // TODO: luego poner el real
         };
 
         let _ = client
