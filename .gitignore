@@ -1,0 +1,51 @@
+# ---- Rust / Cargo ----
+target/
+Cargo.lock
+**/*.rs.bk
+
+# ---- Build artifacts ----
+*.exe
+*.dll
+*.dylib
+*.so
+
+# ---- Logs ----
+*.log
+
+# ---- Environment files ----
+.env
+.env.*
+!.env.example
+
+# ---- Editor / IDE ----
+
+# VSCode
+.vscode/
+.history/
+*.code-workspace
+
+# JetBrains / CLion
+.idea/
+
+# Vim / NeoVim
+*.swp
+*.swo
+
+# Emacs
+*~
+
+# ---- OS files ----
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# ---- Docker ----
+/docker/*.pid
+docker-compose.override.yml
+
+# ---- Misc ----
+/tmp/
