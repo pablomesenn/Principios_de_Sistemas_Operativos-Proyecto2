@@ -5,14 +5,12 @@ use uuid::Uuid;
 
 // ============ Registro de datos ============
 
-/// Un registro es una fila de datos (clave-valor)
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Record {
     pub key: Option<String>,
     pub value: String,
 }
 
-/// Partición de datos (conjunto de registros)
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Partition {
     pub records: Vec<Record>,
@@ -28,6 +26,8 @@ pub struct DagNode {
     pub partitions: Option<u32>,
     pub fn_name: Option<String>,
     pub key: Option<String>,
+    // Para join: segundo input
+    pub join_with: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -79,11 +79,17 @@ pub struct Task {
     pub op: String,
     pub partition_id: u32,
     pub total_partitions: u32,
-    pub input_path: Option<String>,      // para read_csv
-    pub input_partitions: Vec<String>,   // paths de datos de entrada
+    pub input_path: Option<String>,
+    pub input_partitions: Vec<String>,
     pub fn_name: Option<String>,
     pub key: Option<String>,
     pub status: TaskStatus,
+    // Para shuffle: indica si debe leer de shuffle files
+    pub is_shuffle_read: bool,
+    // Para join: paths del segundo dataset
+    pub join_partitions: Vec<String>,
+    // Worker asignado (para replanificación)
+    pub assigned_worker: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -95,6 +101,8 @@ pub struct TaskResult {
     pub error: Option<String>,
     pub output_path: Option<String>,
     pub records_processed: u64,
+    // Paths de shuffle output (uno por partición destino)
+    pub shuffle_outputs: Vec<String>,
 }
 
 // ============ Worker ============

@@ -10,6 +10,9 @@ make run-worker
 
 # Terminal 3
 make run-client-submit
+cargo run --bin client -- submit
+cargo run --bin client -- submit-join
+
 
 --------------------------------
 

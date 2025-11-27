@@ -11,7 +11,6 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Crear directorio de datos
     operators::ensure_data_dir();
     
     let client = Client::new();
@@ -21,7 +20,6 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap_or(9000);
 
-    // Registro con el master
     let reg = WorkerRegistration {
         id: Uuid::nil(),
         host: "127.0.0.1".into(),
@@ -40,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
 
     let active_tasks = Arc::new(AtomicU32::new(0));
 
-    // Loop de heartbeats
+    // Heartbeats
     let hb_client = client.clone();
     let hb_master_url = master_url.clone();
     let hb_active_tasks = active_tasks.clone();
@@ -81,8 +79,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                println!("Ejecutando tarea: {} (op={}, partition={})", 
-                    task.id, task.op, task.partition_id);
+                println!("Ejecutando: {} (op={}, partition={}, attempt={})", 
+                    task.id, task.op, task.partition_id, task.attempt);
                 
                 active_tasks.fetch_add(1, Ordering::Relaxed);
 
@@ -97,7 +95,10 @@ async fn main() -> anyhow::Result<()> {
                 active_tasks.fetch_sub(1, Ordering::Relaxed);
                 
                 if result.success {
-                    println!("  -> OK: {} registros procesados", result.records_processed);
+                    println!("  -> OK: {} registros", result.records_processed);
+                    if !result.shuffle_outputs.is_empty() {
+                        println!("  -> Shuffle outputs: {}", result.shuffle_outputs.len());
+                    }
                 } else {
                     println!("  -> ERROR: {:?}", result.error);
                 }
@@ -120,18 +121,21 @@ fn execute_task(task: &Task) -> TaskResult {
     );
 
     match operators::execute_operator(task) {
-        Ok((partition, records_processed)) => {
-            // Guardar resultado
-            if let Err(e) = operators::write_partition(&output_path, &partition) {
-                return TaskResult {
-                    task_id: task.id,
-                    job_id: task.job_id,
-                    attempt: task.attempt,
-                    success: false,
-                    error: Some(e),
-                    output_path: None,
-                    records_processed: 0,
-                };
+        Ok(result) => {
+            // Guardar resultado (excepto shuffle_write que ya guardó)
+            if task.op != "shuffle_write" {
+                if let Err(e) = operators::write_partition(&output_path, &result.partition) {
+                    return TaskResult {
+                        task_id: task.id,
+                        job_id: task.job_id,
+                        attempt: task.attempt,
+                        success: false,
+                        error: Some(e),
+                        output_path: None,
+                        records_processed: 0,
+                        shuffle_outputs: vec![],
+                    };
+                }
             }
 
             TaskResult {
@@ -141,7 +145,8 @@ fn execute_task(task: &Task) -> TaskResult {
                 success: true,
                 error: None,
                 output_path: Some(output_path),
-                records_processed,
+                records_processed: result.records_processed,
+                shuffle_outputs: result.shuffle_outputs,
             }
         }
         Err(e) => TaskResult {
@@ -152,6 +157,7 @@ fn execute_task(task: &Task) -> TaskResult {
             error: Some(e),
             output_path: None,
             records_processed: 0,
+            shuffle_outputs: vec![],
         },
     }
 }
