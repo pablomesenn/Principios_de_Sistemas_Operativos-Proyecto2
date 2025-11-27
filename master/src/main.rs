@@ -18,7 +18,11 @@ use std::{
 };
 use uuid::Uuid;
 
+// ============ Configuración de tolerancia a fallos ============
 const MAX_TASK_ATTEMPTS: u32 = 3;
+const HEARTBEAT_TIMEOUT_SECS: u64 = 10;
+const MONITOR_INTERVAL_SECS: u64 = 5;
+const RETRY_INTERVAL_SECS: u64 = 2;
 
 #[derive(Clone)]
 struct AppState {
@@ -28,10 +32,12 @@ struct AppState {
     running_tasks: Arc<Mutex<HashMap<Uuid, Task>>>,
     completed_tasks: Arc<Mutex<HashMap<Uuid, TaskResult>>>,
     task_outputs: Arc<Mutex<HashMap<(Uuid, String, u32), String>>>,
-    // Tareas fallidas para reintentar
     failed_tasks: Arc<Mutex<Vec<Task>>>,
-    // Nodos completados por job (para dependencias)
     completed_nodes: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
+    // Para idempotencia: (job_id, node_id, partition_id) -> mejor attempt completado
+    completed_attempts: Arc<Mutex<HashMap<(Uuid, String, u32), u32>>>,
+    // Métricas de fallos
+    failure_counts: Arc<Mutex<HashMap<Uuid, u32>>>,
 }
 
 impl Default for AppState {
@@ -45,12 +51,21 @@ impl Default for AppState {
             task_outputs: Arc::new(Mutex::new(HashMap::new())),
             failed_tasks: Arc::new(Mutex::new(Vec::new())),
             completed_nodes: Arc::new(Mutex::new(HashMap::new())),
+            completed_attempts: Arc::new(Mutex::new(HashMap::new())),
+            failure_counts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 #[tokio::main]
 async fn main() {
+    println!("=== Mini-Spark Master ===");
+    println!("Configuración de tolerancia a fallos:");
+    println!("  - Max intentos por tarea: {}", MAX_TASK_ATTEMPTS);
+    println!("  - Timeout heartbeat: {}s", HEARTBEAT_TIMEOUT_SECS);
+    println!("  - Intervalo monitor: {}s", MONITOR_INTERVAL_SECS);
+    println!();
+
     let state = AppState::default();
 
     // Monitor de workers
@@ -74,6 +89,7 @@ async fn main() {
         .route("/api/v1/jobs", post(submit_job))
         .route("/api/v1/jobs/:id", get(get_job))
         .route("/api/v1/jobs/:id/results", get(get_job_results))
+        .route("/api/v1/metrics/failures", get(get_failure_metrics))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
@@ -108,7 +124,7 @@ async fn register_worker(
     };
 
     state.workers.lock().unwrap().insert(reg.id, worker_info);
-    println!("Worker registrado: {}", reg.id);
+    println!("[WORKER] Registrado: {} ({}:{})", reg.id, reg.host, reg.port);
 
     Json(reg)
 }
@@ -119,9 +135,15 @@ async fn heartbeat(
 ) -> StatusCode {
     let mut workers = state.workers.lock().unwrap();
     if let Some(worker) = workers.get_mut(&hb.worker_id) {
+        let was_down = worker.status == WorkerStatus::Down;
         worker.last_heartbeat = current_timestamp();
         worker.active_tasks = hb.active_tasks;
         worker.status = WorkerStatus::Up;
+        
+        if was_down {
+            println!("[WORKER] Recuperado: {} (tareas activas: {})", hb.worker_id, hb.active_tasks);
+        }
+        
         StatusCode::OK
     } else {
         StatusCode::NOT_FOUND
@@ -149,12 +171,20 @@ async fn get_task_for_worker(
     // Buscar tarea lista
     let mut queue = state.task_queue.lock().unwrap();
     let completed_nodes = state.completed_nodes.lock().unwrap();
+    let completed_attempts = state.completed_attempts.lock().unwrap();
     
+    // Filtrar tareas que ya fueron completadas (idempotencia)
     let ready_idx = queue.iter().position(|task| {
+        // Verificar si ya hay un attempt exitoso para esta partición
+        let key = (task.job_id, task.node_id.clone(), task.partition_id);
+        if completed_attempts.contains_key(&key) {
+            return false; // Ya completada, no asignar
+        }
         is_task_ready(task, &completed_nodes)
     });
     
     drop(completed_nodes);
+    drop(completed_attempts);
 
     if let Some(idx) = ready_idx {
         let mut task = queue.remove(idx).unwrap();
@@ -167,7 +197,7 @@ async fn get_task_for_worker(
             w.active_tasks += 1;
         }
         
-        println!("Asignada: {} (op={}, p={}, attempt={}) -> worker {}", 
+        println!("[TASK] Asignada: {} (op={}, p={}, attempt={}) -> worker {}", 
             task.id, task.op, task.partition_id, task.attempt, worker_id);
         Ok(Json(task))
     } else {
@@ -189,10 +219,28 @@ async fn complete_task(
             }
         }
 
-        // IMPORTANTE: Guardar resultado ANTES de verificar completitud
-        state.completed_tasks.lock().unwrap().insert(result.task_id, result.clone());
+        // Verificar idempotencia: si ya hay un attempt exitoso, ignorar
+        let task_key = (task.job_id, task.node_id.clone(), task.partition_id);
+        {
+            let completed_attempts = state.completed_attempts.lock().unwrap();
+            if let Some(&completed_attempt) = completed_attempts.get(&task_key) {
+                if result.attempt <= completed_attempt {
+                    println!("[TASK] Ignorada (duplicado): {} attempt={} (ya completado attempt={})", 
+                        result.task_id, result.attempt, completed_attempt);
+                    return StatusCode::OK;
+                }
+            }
+        }
 
         if result.success {
+            // Marcar como completada para idempotencia
+            state.completed_attempts.lock().unwrap()
+                .insert(task_key, result.attempt);
+            
+            // Guardar resultado
+            state.completed_tasks.lock().unwrap()
+                .insert(result.task_id, result.clone());
+
             // Guardar output path
             if let Some(ref path) = result.output_path {
                 state.task_outputs.lock().unwrap().insert(
@@ -207,9 +255,15 @@ async fn complete_task(
             // Actualizar inputs de tareas dependientes
             update_dependent_tasks(&state, &task, &result);
             
-            println!("Completada: {} (records={})", result.task_id, result.records_processed);
+            println!("[TASK] Completada: {} (records={}, attempt={})", 
+                result.task_id, result.records_processed, result.attempt);
         } else {
-            // Tarea falló - programar reintento
+            // Incrementar contador de fallos
+            *state.failure_counts.lock().unwrap()
+                .entry(task.job_id)
+                .or_insert(0) += 1;
+
+            // Tarea falló - programar reintento si no excede límite
             if task.attempt < MAX_TASK_ATTEMPTS {
                 let mut retry_task = task.clone();
                 retry_task.id = Uuid::new_v4();
@@ -218,17 +272,18 @@ async fn complete_task(
                 retry_task.assigned_worker = None;
                 
                 state.failed_tasks.lock().unwrap().push(retry_task);
-                println!("Falló: {} - reintento #{} programado", 
-                    result.task_id, task.attempt + 1);
+                println!("[TASK] Falló: {} - reintento {}/{} programado (error: {:?})", 
+                    result.task_id, task.attempt + 1, MAX_TASK_ATTEMPTS, result.error);
             } else {
+                // Marcar job como fallido
                 let mut jobs = state.jobs.lock().unwrap();
                 if let Some(job) = jobs.get_mut(&task.job_id) {
                     job.status = JobStatus::Failed(
-                        format!("Tarea {} falló después de {} intentos: {:?}",
+                        format!("Tarea '{}' falló después de {} intentos: {:?}",
                             task.node_id, MAX_TASK_ATTEMPTS, result.error)
                     );
                 }
-                println!("FATAL: {} falló después de {} intentos", 
+                println!("[TASK] FATAL: {} falló después de {} intentos - JOB FALLIDO", 
                     result.task_id, MAX_TASK_ATTEMPTS);
             }
         }
@@ -254,17 +309,18 @@ async fn submit_job(
 
     state.jobs.lock().unwrap().insert(job_id, job.clone());
     state.completed_nodes.lock().unwrap().insert(job_id, HashSet::new());
+    state.failure_counts.lock().unwrap().insert(job_id, 0);
 
     let tasks = generate_tasks_from_dag(&req.dag, job_id, req.parallelism);
     let task_count = tasks.len();
     
     let mut queue = state.task_queue.lock().unwrap();
     for task in tasks {
-        println!("Encolada: {} (op={}, p={})", task.id, task.op, task.partition_id);
+        println!("[TASK] Encolada: {} (op={}, p={})", task.id, task.op, task.partition_id);
         queue.push_back(task);
     }
 
-    println!("Job {} iniciado con {} tareas", job_id, task_count);
+    println!("[JOB] {} iniciado con {} tareas", job_id, task_count);
     Json(job)
 }
 
@@ -295,6 +351,35 @@ async fn get_job_results(
     } else {
         Ok(Json(results))
     }
+}
+
+async fn get_failure_metrics(
+    State(state): State<AppState>,
+) -> Json<HashMap<String, serde_json::Value>> {
+    let failure_counts = state.failure_counts.lock().unwrap();
+    let workers = state.workers.lock().unwrap();
+    
+    let mut metrics = HashMap::new();
+    
+    // Fallos por job
+    let job_failures: HashMap<String, u32> = failure_counts
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect();
+    metrics.insert("job_failures".to_string(), serde_json::json!(job_failures));
+    
+    // Estado de workers
+    let worker_status: HashMap<String, String> = workers
+        .iter()
+        .map(|(id, w)| (id.to_string(), format!("{:?}", w.status)))
+        .collect();
+    metrics.insert("worker_status".to_string(), serde_json::json!(worker_status));
+    
+    // Workers caídos
+    let down_count = workers.values().filter(|w| w.status == WorkerStatus::Down).count();
+    metrics.insert("workers_down".to_string(), serde_json::json!(down_count));
+    
+    Json(metrics)
 }
 
 // ============ Funciones auxiliares ============
@@ -339,13 +424,10 @@ fn is_task_ready(task: &Task, completed_nodes: &HashMap<Uuid, HashSet<String>>) 
 }
 
 fn extract_node_id_from_path(path: &str, job_id: &str) -> Option<String> {
-    // Path format: /tmp/minispark/{job_id}_{node_id}_p{partition}.json
     let filename = path.rsplit('/').next()?;
     let prefix = format!("{}_", job_id);
     let rest = filename.strip_prefix(&prefix)?;
     
-    // Buscar "_p" seguido de un dígito (el partition number)
-    // rest = "{node_id}_p{partition}.json"
     let mut last_p_pos = None;
     let chars: Vec<char> = rest.chars().collect();
     
@@ -371,7 +453,6 @@ fn check_node_completion(state: &AppState, task: &Task) {
     for r in completed.values() {
         if r.job_id == task.job_id && r.success {
             if let Some(ref path) = r.output_path {
-                // Extraer node_id del path y comparar
                 if let Some(node_id) = extract_node_id_from_path(path, &task.job_id.to_string()) {
                     if node_id == task.node_id {
                         completed_partitions += 1;
@@ -389,7 +470,7 @@ fn check_node_completion(state: &AppState, task: &Task) {
             .or_default()
             .insert(task.node_id.clone());
         
-        println!("Nodo '{}' completado ({}/{} particiones)", 
+        println!("[NODE] '{}' completado ({}/{} particiones)", 
             task.node_id, completed_partitions, total_partitions);
     }
 }
@@ -436,7 +517,6 @@ fn update_dependent_tasks(state: &AppState, completed_task: &Task, result: &Task
 fn generate_tasks_from_dag(dag: &Dag, job_id: Uuid, parallelism: u32) -> Vec<Task> {
     let mut tasks = Vec::new();
     
-    // Construir mapa de dependencias
     let mut deps: HashMap<&str, Vec<&str>> = HashMap::new();
     for (from, to) in &dag.edges {
         deps.entry(to.as_str()).or_default().push(from.as_str());
@@ -459,7 +539,6 @@ fn generate_tasks_from_dag(dag: &Dag, job_id: Uuid, parallelism: u32) -> Vec<Tas
                 })
                 .unwrap_or_default();
             
-            // Para join: paths del segundo dataset
             let join_partitions: Vec<String> = node.join_with.as_ref()
                 .map(|join_node| {
                     (0..num_partitions)
@@ -471,7 +550,7 @@ fn generate_tasks_from_dag(dag: &Dag, job_id: Uuid, parallelism: u32) -> Vec<Tas
             let task = Task {
                 id: Uuid::new_v4(),
                 job_id,
-                attempt: 1,
+                attempt: 0, // Empieza en 0, no en 1
                 node_id: node.id.clone(),
                 op: node.op.clone(),
                 partition_id,
@@ -520,15 +599,17 @@ fn update_job_progress(state: &AppState, job_id: Uuid) {
             job.progress = progress;
             if progress >= 100.0 && job.status == JobStatus::Running {
                 job.status = JobStatus::Succeeded;
-                println!("Job {} completado!", job_id);
+                println!("[JOB] {} completado exitosamente!", job_id);
             }
         }
     }
 }
 
 async fn monitor_workers(state: AppState) {
+    println!("[MONITOR] Iniciado - verificando workers cada {}s", MONITOR_INTERVAL_SECS);
+    
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(MONITOR_INTERVAL_SECS)).await;
         
         let now = current_timestamp();
         let mut down_workers = Vec::new();
@@ -536,10 +617,11 @@ async fn monitor_workers(state: AppState) {
         {
             let mut workers = state.workers.lock().unwrap();
             for (id, worker) in workers.iter_mut() {
-                if worker.status == WorkerStatus::Up && now - worker.last_heartbeat > 10 {
+                if worker.status == WorkerStatus::Up && now - worker.last_heartbeat > HEARTBEAT_TIMEOUT_SECS {
                     worker.status = WorkerStatus::Down;
                     down_workers.push(*id);
-                    println!("Worker {} DOWN (sin heartbeat)", id);
+                    println!("[MONITOR] Worker {} marcado DOWN (sin heartbeat por {}s)", 
+                        id, now - worker.last_heartbeat);
                 }
             }
         }
@@ -554,6 +636,7 @@ async fn monitor_workers(state: AppState) {
 fn reschedule_worker_tasks(state: &AppState, worker_id: Uuid) {
     let mut running = state.running_tasks.lock().unwrap();
     let mut queue = state.task_queue.lock().unwrap();
+    let completed_attempts = state.completed_attempts.lock().unwrap();
     
     let tasks_to_reschedule: Vec<Task> = running
         .values()
@@ -561,23 +644,54 @@ fn reschedule_worker_tasks(state: &AppState, worker_id: Uuid) {
         .cloned()
         .collect();
     
+    let mut rescheduled_count = 0;
+    
     for task in tasks_to_reschedule {
+        // Verificar si ya fue completada (idempotencia)
+        let key = (task.job_id, task.node_id.clone(), task.partition_id);
+        if completed_attempts.contains_key(&key) {
+            println!("[RESCHEDULE] Ignorando tarea {} (ya completada)", task.id);
+            running.remove(&task.id);
+            continue;
+        }
+        
         running.remove(&task.id);
         
-        let mut retry_task = task.clone();
-        retry_task.id = Uuid::new_v4();
-        retry_task.attempt += 1;
-        retry_task.status = TaskStatus::Pending;
-        retry_task.assigned_worker = None;
-        
-        println!("Replanificando tarea {} (intento {})", retry_task.node_id, retry_task.attempt);
-        queue.push_back(retry_task);
+        if task.attempt < MAX_TASK_ATTEMPTS {
+            let mut retry_task = task.clone();
+            retry_task.id = Uuid::new_v4();
+            retry_task.attempt += 1;
+            retry_task.status = TaskStatus::Pending;
+            retry_task.assigned_worker = None;
+            
+            println!("[RESCHEDULE] Tarea {} replanificada (intento {}/{})", 
+                retry_task.node_id, retry_task.attempt + 1, MAX_TASK_ATTEMPTS);
+            queue.push_back(retry_task);
+            rescheduled_count += 1;
+        } else {
+            println!("[RESCHEDULE] Tarea {} excedió reintentos - marcando job fallido", task.node_id);
+            drop(running);
+            drop(queue);
+            drop(completed_attempts);
+            
+            let mut jobs = state.jobs.lock().unwrap();
+            if let Some(job) = jobs.get_mut(&task.job_id) {
+                job.status = JobStatus::Failed(
+                    format!("Worker {} caído y tarea '{}' excedió reintentos", worker_id, task.node_id)
+                );
+            }
+            return;
+        }
+    }
+    
+    if rescheduled_count > 0 {
+        println!("[RESCHEDULE] {} tareas replanificadas del worker {}", rescheduled_count, worker_id);
     }
 }
 
 async fn retry_failed_tasks(state: AppState) {
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_INTERVAL_SECS)).await;
         
         let tasks: Vec<Task> = {
             let mut failed = state.failed_tasks.lock().unwrap();
@@ -586,8 +700,18 @@ async fn retry_failed_tasks(state: AppState) {
         
         if !tasks.is_empty() {
             let mut queue = state.task_queue.lock().unwrap();
+            let completed_attempts = state.completed_attempts.lock().unwrap();
+            
             for task in tasks {
-                println!("Reintentando tarea {} (intento {})", task.node_id, task.attempt);
+                // Verificar idempotencia antes de reintentar
+                let key = (task.job_id, task.node_id.clone(), task.partition_id);
+                if completed_attempts.contains_key(&key) {
+                    println!("[RETRY] Ignorando tarea {} (ya completada)", task.id);
+                    continue;
+                }
+                
+                println!("[RETRY] Reintentando tarea {} (intento {}/{})", 
+                    task.node_id, task.attempt + 1, MAX_TASK_ATTEMPTS);
                 queue.push_back(task);
             }
         }

@@ -13,6 +13,8 @@ make run-client-submit
 cargo run --bin client -- submit
 cargo run --bin client -- submit-join
 
+make create-test-data
+make run-client-submit
 
 --------------------------------
 
