@@ -49,3 +49,6 @@ docker-compose.override.yml
 
 # ---- Misc ----
 /tmp/
+
+# ---- pdf ----
+_PSO_PY02b__Simplementacion_de_SparkFlink.pdf
