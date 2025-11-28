@@ -1,5 +1,6 @@
 // master/src/main.rs
 
+mod job_metrics;
 mod persistence;
 
 use axum::{
@@ -9,9 +10,10 @@ use axum::{
     Json, Router,
 };
 use common::{
-    Dag, DagNode, Heartbeat, JobInfo, JobRequest, JobStatus,
+    Dag, DagNode, Heartbeat, JobInfo, JobMetrics, JobRequest, JobStatus, Logger,
     Task, TaskResult, TaskStatus, WorkerInfo, WorkerRegistration, WorkerStatus,
 };
+use job_metrics::{new_shared_job_metrics, SharedJobMetrics};
 use persistence::PersistenceManager;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -41,6 +43,7 @@ struct AppState {
     completed_attempts: Arc<Mutex<HashMap<(Uuid, String, u32), u32>>>,
     failure_counts: Arc<Mutex<HashMap<Uuid, u32>>>,
     persistence: PersistenceManager,
+    job_metrics: SharedJobMetrics,
 }
 
 impl AppState {
@@ -57,18 +60,19 @@ impl AppState {
             completed_attempts: Arc::new(Mutex::new(HashMap::new())),
             failure_counts: Arc::new(Mutex::new(HashMap::new())),
             persistence: PersistenceManager::new(),
+            job_metrics: new_shared_job_metrics(),
         }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    println!("=== Mini-Spark Master ===");
-    println!("Configuración:");
-    println!("  - Max intentos por tarea: {}", MAX_TASK_ATTEMPTS);
-    println!("  - Timeout heartbeat: {}s", HEARTBEAT_TIMEOUT_SECS);
-    println!("  - Intervalo persistencia: {}s", PERSISTENCE_INTERVAL_SECS);
-    println!();
+    let log = Logger::new("MASTER");
+    
+    log.emit(log.info("Mini-Spark Master iniciando")
+        .field("max_attempts", MAX_TASK_ATTEMPTS)
+        .field("heartbeat_timeout", HEARTBEAT_TIMEOUT_SECS)
+        .field("persistence_interval", PERSISTENCE_INTERVAL_SECS));
 
     let state = AppState::new();
 
@@ -99,14 +103,16 @@ async fn main() {
         .route("/api/v1/jobs", post(submit_job))
         .route("/api/v1/jobs/:id", get(get_job))
         .route("/api/v1/jobs/:id/results", get(get_job_results))
+        .route("/api/v1/jobs/:id/metrics", get(get_job_metrics))
+        .route("/api/v1/jobs/:id/stages", get(get_job_stages))
         .route("/api/v1/metrics/failures", get(get_failure_metrics))
-        .route("/api/v1/metrics/cache", get(get_cache_metrics))
+        .route("/api/v1/metrics/jobs", get(get_all_job_metrics))
+        .route("/api/v1/metrics/system", get(get_system_metrics))
         .route("/api/v1/state", get(get_persisted_state))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    println!("[MONITOR] Iniciado - verificando workers cada {}s", MONITOR_INTERVAL_SECS);
-    println!("Master escuchando en {}", addr);
+    log.emit(log.info("Master escuchando").field("addr", addr.to_string()));
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -125,6 +131,8 @@ async fn register_worker(
     State(state): State<AppState>,
     Json(mut reg): Json<WorkerRegistration>,
 ) -> Json<WorkerRegistration> {
+    let log = Logger::new("WORKER");
+    
     if reg.id.is_nil() {
         reg.id = Uuid::new_v4();
     }
@@ -137,7 +145,11 @@ async fn register_worker(
     };
 
     state.workers.lock().unwrap().insert(reg.id, worker_info);
-    println!("[WORKER] Registrado: {} ({}:{})", reg.id, reg.host, reg.port);
+    
+    log.emit(log.info("Worker registrado")
+        .field("worker_id", reg.id.to_string())
+        .field("host", &reg.host)
+        .field("port", reg.port));
 
     Json(reg)
 }
@@ -154,7 +166,10 @@ async fn heartbeat(
         worker.status = WorkerStatus::Up;
         
         if was_down {
-            println!("[WORKER] Recuperado: {} (tareas activas: {})", hb.worker_id, hb.active_tasks);
+            let log = Logger::new("WORKER");
+            log.emit(log.info("Worker recuperado")
+                .field("worker_id", hb.worker_id.to_string())
+                .field("active_tasks", hb.active_tasks));
         }
         
         StatusCode::OK
@@ -206,8 +221,14 @@ async fn get_task_for_worker(
             w.active_tasks += 1;
         }
         
-        println!("[TASK] Asignada: {} (op={}, p={}, attempt={}) -> worker {}", 
-            task.id, task.op, task.partition_id, task.attempt, worker_id);
+        let log = Logger::new("TASK");
+        log.emit(log.info("Tarea asignada")
+            .field("task_id", task.id.to_string())
+            .field("op", &task.op)
+            .field("partition", task.partition_id)
+            .field("attempt", task.attempt)
+            .field("worker", worker_id.to_string()));
+        
         Ok(Json(task))
     } else {
         Err(StatusCode::NO_CONTENT)
@@ -218,6 +239,7 @@ async fn complete_task(
     State(state): State<AppState>,
     Json(result): Json<TaskResult>,
 ) -> StatusCode {
+    let log = Logger::new("TASK");
     let task_info = state.running_tasks.lock().unwrap().remove(&result.task_id);
     
     if let Some(task) = task_info {
@@ -232,8 +254,9 @@ async fn complete_task(
             let completed_attempts = state.completed_attempts.lock().unwrap();
             if let Some(&completed_attempt) = completed_attempts.get(&task_key) {
                 if result.attempt <= completed_attempt {
-                    println!("[TASK] Ignorada (duplicado): {} attempt={}", 
-                        result.task_id, result.attempt);
+                    log.emit(log.debug("Tarea duplicada ignorada")
+                        .field("task_id", result.task_id.to_string())
+                        .field("attempt", result.attempt));
                     return StatusCode::OK;
                 }
             }
@@ -253,15 +276,23 @@ async fn complete_task(
                 );
             }
             
+            // Actualizar métricas del job
+            state.job_metrics.lock().unwrap()
+                .task_completed(task.job_id, &task.node_id, result.records_processed);
+            
             check_node_completion(&state, &task);
             update_dependent_tasks(&state, &task, &result);
             
-            println!("[TASK] Completada: {} (records={}, attempt={})", 
-                result.task_id, result.records_processed, result.attempt);
+            log.emit(log.info("Tarea completada")
+                .field("task_id", result.task_id.to_string())
+                .field("records", result.records_processed)
+                .field("attempt", result.attempt));
         } else {
             *state.failure_counts.lock().unwrap()
                 .entry(task.job_id)
                 .or_insert(0) += 1;
+            
+            state.job_metrics.lock().unwrap().task_failed(task.job_id);
 
             if task.attempt < MAX_TASK_ATTEMPTS {
                 let mut retry_task = task.clone();
@@ -271,8 +302,12 @@ async fn complete_task(
                 retry_task.assigned_worker = None;
                 
                 state.failed_tasks.lock().unwrap().push(retry_task);
-                println!("[TASK] Falló: {} - reintento {}/{} programado", 
-                    result.task_id, task.attempt + 1, MAX_TASK_ATTEMPTS);
+                
+                log.emit(log.warn("Tarea fallida, reintentando")
+                    .field("task_id", result.task_id.to_string())
+                    .field("attempt", task.attempt)
+                    .field("max_attempts", MAX_TASK_ATTEMPTS)
+                    .field("error", result.error.as_deref().unwrap_or("unknown")));
             } else {
                 let mut jobs = state.jobs.lock().unwrap();
                 if let Some(job) = jobs.get_mut(&task.job_id) {
@@ -282,8 +317,11 @@ async fn complete_task(
                     );
                     state.persistence.save_job(job);
                 }
-                println!("[TASK] FATAL: {} falló después de {} intentos", 
-                    result.task_id, MAX_TASK_ATTEMPTS);
+                
+                log.emit(log.error("Tarea fallida permanentemente")
+                    .field("task_id", result.task_id.to_string())
+                    .field("node", &task.node_id)
+                    .field("attempts", MAX_TASK_ATTEMPTS));
             }
         }
         
@@ -297,6 +335,7 @@ async fn submit_job(
     State(state): State<AppState>,
     Json(req): Json<JobRequest>,
 ) -> Json<JobInfo> {
+    let log = Logger::new("JOB");
     let job_id = Uuid::new_v4();
     
     let job = JobInfo {
@@ -310,7 +349,11 @@ async fn submit_job(
     state.completed_nodes.lock().unwrap().insert(job_id, HashSet::new());
     state.failure_counts.lock().unwrap().insert(job_id, 0);
     
-    // Persistir job nuevo
+    // Registrar métricas del job
+    let stages: Vec<String> = req.dag.nodes.iter().map(|n| n.id.clone()).collect();
+    state.job_metrics.lock().unwrap()
+        .register_job(job_id, req.name.clone(), stages, req.parallelism);
+    
     state.persistence.save_job(&job);
 
     let tasks = generate_tasks_from_dag(&req.dag, job_id, req.parallelism);
@@ -318,11 +361,15 @@ async fn submit_job(
     
     let mut queue = state.task_queue.lock().unwrap();
     for task in tasks {
-        println!("[TASK] Encolada: {} (op={}, p={})", task.id, task.op, task.partition_id);
         queue.push_back(task);
     }
 
-    println!("[JOB] {} iniciado con {} tareas", job_id, task_count);
+    log.emit(log.info("Job iniciado")
+        .field("job_id", job_id.to_string())
+        .field("name", &req.name)
+        .field("tasks", task_count)
+        .field("parallelism", req.parallelism));
+    
     Json(job)
 }
 
@@ -355,6 +402,26 @@ async fn get_job_results(
     }
 }
 
+async fn get_job_metrics(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<JobMetrics>, StatusCode> {
+    state.job_metrics.lock().unwrap()
+        .get_metrics(id)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn get_job_stages(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<job_metrics::StageStats>>, StatusCode> {
+    state.job_metrics.lock().unwrap()
+        .get_stage_stats(id)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 async fn get_failure_metrics(
     State(state): State<AppState>,
 ) -> Json<HashMap<String, serde_json::Value>> {
@@ -381,12 +448,31 @@ async fn get_failure_metrics(
     Json(metrics)
 }
 
-async fn get_cache_metrics(
-    State(_state): State<AppState>,
-) -> Json<HashMap<String, String>> {
-    // Placeholder - los workers reportan sus propias métricas de cache
+async fn get_all_job_metrics(
+    State(state): State<AppState>,
+) -> Json<Vec<JobMetrics>> {
+    Json(state.job_metrics.lock().unwrap().get_all_metrics())
+}
+
+async fn get_system_metrics(
+    State(state): State<AppState>,
+) -> Json<HashMap<String, serde_json::Value>> {
+    let workers = state.workers.lock().unwrap();
+    let jobs = state.jobs.lock().unwrap();
+    let queue = state.task_queue.lock().unwrap();
+    let running = state.running_tasks.lock().unwrap();
+    
     let mut metrics = HashMap::new();
-    metrics.insert("note".to_string(), "Cache metrics are reported by individual workers".to_string());
+    
+    metrics.insert("workers_total".to_string(), serde_json::json!(workers.len()));
+    metrics.insert("workers_up".to_string(), 
+        serde_json::json!(workers.values().filter(|w| w.status == WorkerStatus::Up).count()));
+    metrics.insert("jobs_total".to_string(), serde_json::json!(jobs.len()));
+    metrics.insert("jobs_running".to_string(), 
+        serde_json::json!(jobs.values().filter(|j| j.status == JobStatus::Running).count()));
+    metrics.insert("tasks_queued".to_string(), serde_json::json!(queue.len()));
+    metrics.insert("tasks_running".to_string(), serde_json::json!(running.len()));
+    
     Json(metrics)
 }
 
@@ -481,8 +567,10 @@ fn check_node_completion(state: &AppState, task: &Task) {
             .or_default()
             .insert(task.node_id.clone());
         
-        println!("[NODE] '{}' completado ({}/{} particiones)", 
-            task.node_id, completed_partitions, total_partitions);
+        let log = Logger::new("NODE");
+        log.emit(log.info("Nodo completado")
+            .field("node", &task.node_id)
+            .field("partitions", format!("{}/{}", completed_partitions, total_partitions)));
     }
 }
 
@@ -609,13 +697,21 @@ fn update_job_progress(state: &AppState, job_id: Uuid) {
             if progress >= 100.0 && job.status == JobStatus::Running {
                 job.status = JobStatus::Succeeded;
                 state.persistence.save_job(job);
-                println!("[JOB] {} completado exitosamente!", job_id);
+                state.job_metrics.lock().unwrap().job_finished(job_id);
+                
+                let log = Logger::new("JOB");
+                log.emit(log.info("Job completado exitosamente")
+                    .field("job_id", job_id.to_string()));
             }
         }
     }
 }
 
 async fn monitor_workers(state: AppState) {
+    let log = Logger::new("MONITOR");
+    log.emit(log.info("Monitor iniciado")
+        .field("interval_secs", MONITOR_INTERVAL_SECS));
+    
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(MONITOR_INTERVAL_SECS)).await;
         
@@ -628,8 +724,10 @@ async fn monitor_workers(state: AppState) {
                 if worker.status == WorkerStatus::Up && now - worker.last_heartbeat > HEARTBEAT_TIMEOUT_SECS {
                     worker.status = WorkerStatus::Down;
                     down_workers.push(*id);
-                    println!("[MONITOR] Worker {} marcado DOWN (sin heartbeat por {}s)", 
-                        id, now - worker.last_heartbeat);
+                    
+                    log.emit(log.warn("Worker marcado DOWN")
+                        .field("worker_id", id.to_string())
+                        .field("last_seen_secs", now - worker.last_heartbeat));
                 }
             }
         }
@@ -641,6 +739,7 @@ async fn monitor_workers(state: AppState) {
 }
 
 fn reschedule_worker_tasks(state: &AppState, worker_id: Uuid) {
+    let log = Logger::new("RESCHEDULE");
     let mut running = state.running_tasks.lock().unwrap();
     let mut queue = state.task_queue.lock().unwrap();
     let completed_attempts = state.completed_attempts.lock().unwrap();
@@ -669,19 +768,21 @@ fn reschedule_worker_tasks(state: &AppState, worker_id: Uuid) {
             retry_task.status = TaskStatus::Pending;
             retry_task.assigned_worker = None;
             
-            println!("[RESCHEDULE] Tarea {} replanificada (intento {}/{})", 
-                retry_task.node_id, retry_task.attempt + 1, MAX_TASK_ATTEMPTS);
             queue.push_back(retry_task);
             rescheduled_count += 1;
         }
     }
     
     if rescheduled_count > 0 {
-        println!("[RESCHEDULE] {} tareas replanificadas del worker {}", rescheduled_count, worker_id);
+        log.emit(log.info("Tareas replanificadas")
+            .field("worker_id", worker_id.to_string())
+            .field("count", rescheduled_count));
     }
 }
 
 async fn retry_failed_tasks(state: AppState) {
+    let log = Logger::new("RETRY");
+    
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_INTERVAL_SECS)).await;
         
@@ -700,8 +801,10 @@ async fn retry_failed_tasks(state: AppState) {
                     continue;
                 }
                 
-                println!("[RETRY] Reintentando tarea {} (intento {}/{})", 
-                    task.node_id, task.attempt + 1, MAX_TASK_ATTEMPTS);
+                log.emit(log.info("Reintentando tarea")
+                    .field("node", &task.node_id)
+                    .field("attempt", task.attempt));
+                
                 queue.push_back(task);
             }
         }
@@ -712,7 +815,6 @@ async fn periodic_persistence(state: AppState) {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(PERSISTENCE_INTERVAL_SECS)).await;
         
-        // Guardar todos los jobs actuales
         let jobs = state.jobs.lock().unwrap().clone();
         for job in jobs.values() {
             state.persistence.save_job(job);

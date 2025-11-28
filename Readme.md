@@ -1,4 +1,4 @@
-Para probar: 
+#Para probar las bases: 
 
 cargo build
 
@@ -15,6 +15,40 @@ cargo run --bin client -- submit-join
 
 make create-test-data
 make run-client-submit
+
+# Para probar cache 
+
+# Cache pequeño para forzar spill
+CACHE=1 make run-worker
+
+# Ver estado persistido
+make state
+
+# Test completo de cache
+make test-cache
+
+
+# Probas metricas 
+
+# Con logging en JSON
+LOG_FORMAT=json make run-worker
+
+# Con nivel DEBUG
+LOG_LEVEL=DEBUG make run-worker
+
+# Crear datos de prueba
+make create-test-data
+
+# Enviar job
+make run-client-submit
+
+# Ver métricas
+make metrics-system
+make metrics-jobs
+ID=<job-id> make metrics-job
+
+# Test completo automatizado
+make test-metrics
 
 --------------------------------
 

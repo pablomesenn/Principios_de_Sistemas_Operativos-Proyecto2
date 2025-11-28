@@ -1,14 +1,16 @@
 // worker/src/main.rs
 
 mod cache;
+mod metrics;
 mod operators;
 
 use cache::{new_shared_cache, SharedCache};
-use common::{Heartbeat, Task, TaskResult, WorkerRegistration};
+use common::{Heartbeat, Logger, Task, TaskResult, WorkerRegistration};
+use metrics::{new_shared_metrics, SharedMetrics};
 use reqwest::Client;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 // Configuración
@@ -16,10 +18,12 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 2;
 const POLL_INTERVAL_MS: u64 = 100;
 const POLL_INTERVAL_NO_TASK_MS: u64 = 200;
 const POLL_INTERVAL_ERROR_SECS: u64 = 1;
-const CACHE_STATS_INTERVAL_SECS: u64 = 30;
+const METRICS_REPORT_INTERVAL_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let log = Logger::new("WORKER");
+    
     operators::ensure_data_dir();
     
     let client = Client::new();
@@ -34,13 +38,14 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap_or(0);
 
-    println!("=== Mini-Spark Worker ===");
-    println!("Master: {}", master_url);
-    println!("Puerto: {}", worker_port);
+    log.emit(log.info("Mini-Spark Worker iniciando")
+        .field("master", &master_url)
+        .field("port", worker_port));
+
     if fail_probability > 0 {
-        println!("MODO TEST: Probabilidad de fallo simulado: {}%", fail_probability);
+        log.emit(log.warn("Modo test activado")
+            .field("fail_probability", format!("{}%", fail_probability)));
     }
-    println!();
 
     // Inicializar cache
     let cache = new_shared_cache();
@@ -59,7 +64,12 @@ async fn main() -> anyhow::Result<()> {
 
     let reg_res: WorkerRegistration = res.json().await?;
     let worker_id = reg_res.id;
-    println!("[WORKER] Registrado con ID: {}", worker_id);
+    
+    log.emit(log.info("Worker registrado")
+        .field("worker_id", worker_id.to_string()));
+
+    // Inicializar métricas
+    let metrics = new_shared_metrics(worker_id.to_string());
 
     let active_tasks = Arc::new(AtomicU32::new(0));
 
@@ -68,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
     let hb_master_url = master_url.clone();
     let hb_active_tasks = active_tasks.clone();
     tokio::spawn(async move {
+        let log = Logger::new("HEARTBEAT");
         loop {
             let hb = Heartbeat {
                 worker_id,
@@ -81,30 +92,75 @@ async fn main() -> anyhow::Result<()> {
                 .await;
             
             if let Err(e) = result {
-                println!("[HEARTBEAT] Error enviando heartbeat: {}", e);
+                log.emit(log.error("Error enviando heartbeat")
+                    .field("error", e.to_string()));
             }
 
             tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
         }
     });
 
-    // Reporte periódico de estadísticas del cache
-    let stats_cache = cache.clone();
+    // Reporte periódico de métricas
+    let metrics_clone = metrics.clone();
+    let cache_clone = cache.clone();
     tokio::spawn(async move {
+        let log = Logger::new("METRICS");
         loop {
-            tokio::time::sleep(Duration::from_secs(CACHE_STATS_INTERVAL_SECS)).await;
-            let stats = stats_cache.lock().unwrap().stats();
-            println!("[CACHE] Stats: {:.1}MB/{:.1}MB usado, {} en memoria, {} en disco, hits={}, misses={}, spills={}",
-                stats.current_memory_mb,
-                stats.max_memory_mb,
-                stats.cached_partitions,
-                stats.spilled_partitions,
-                stats.hits,
-                stats.misses,
-                stats.spills
+            tokio::time::sleep(Duration::from_secs(METRICS_REPORT_INTERVAL_SECS)).await;
+            
+            let cache_stats = cache_clone.lock().unwrap().stats();
+            let worker_metrics = metrics_clone.lock().unwrap().get_metrics(
+                cache_stats.hits,
+                cache_stats.misses,
+                cache_stats.current_memory_mb,
             );
+            
+            log.emit(log.info("Métricas del worker")
+                .field("uptime_secs", worker_metrics.uptime_secs)
+                .field("cpu_percent", format!("{:.1}", worker_metrics.system.cpu_usage_percent))
+                .field("mem_percent", format!("{:.1}", worker_metrics.system.memory_percent))
+                .field("tasks_executed", worker_metrics.tasks.total_executed)
+                .field("tasks_succeeded", worker_metrics.tasks.total_succeeded)
+                .field("tasks_failed", worker_metrics.tasks.total_failed)
+                .field("avg_latency_ms", format!("{:.1}", worker_metrics.tasks.avg_latency_ms))
+                .field("throughput", format!("{:.1}", worker_metrics.tasks.throughput_records_per_sec))
+                .field("cache_hits", worker_metrics.cache_hits)
+                .field("cache_misses", worker_metrics.cache_misses));
         }
     });
+
+    // Endpoint HTTP para métricas (opcional)
+    let metrics_for_server = metrics.clone();
+    let cache_for_server = cache.clone();
+    tokio::spawn(async move {
+        use axum::{routing::get, Router, Json};
+        
+        let app = Router::new()
+            .route("/metrics", get({
+                let m = metrics_for_server.clone();
+                let c = cache_for_server.clone();
+                move || {
+                    let m = m.clone();
+                    let c = c.clone();
+                    async move {
+                        let cache_stats = c.lock().unwrap().stats();
+                        let metrics = m.lock().unwrap().get_metrics(
+                            cache_stats.hits,
+                            cache_stats.misses,
+                            cache_stats.current_memory_mb,
+                        );
+                        Json(metrics)
+                    }
+                }
+            }));
+        
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], worker_port + 1000));
+        if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+            let _ = axum::serve(listener, app).await;
+        }
+    });
+
+    let task_log = Logger::new("TASK");
 
     // Loop principal
     loop {
@@ -126,12 +182,18 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                println!("[TASK] Ejecutando: {} (op={}, partition={}, attempt={})", 
-                    task.id, task.op, task.partition_id, task.attempt);
+                task_log.emit(task_log.info("Ejecutando tarea")
+                    .field("task_id", task.id.to_string())
+                    .field("op", &task.op)
+                    .field("partition", task.partition_id)
+                    .field("attempt", task.attempt));
                 
                 active_tasks.fetch_add(1, Ordering::Relaxed);
+                metrics.lock().unwrap().task_started();
 
+                let start_time = Instant::now();
                 let result = execute_task_with_failure_simulation(&task, fail_probability, &cache);
+                let elapsed = start_time.elapsed();
 
                 let send_result = client
                     .post(format!("{}/api/v1/workers/task/complete", master_url))
@@ -140,25 +202,34 @@ async fn main() -> anyhow::Result<()> {
                     .await;
 
                 if let Err(e) = send_result {
-                    println!("[TASK] Error reportando resultado: {}", e);
+                    task_log.emit(task_log.error("Error reportando resultado")
+                        .field("task_id", task.id.to_string())
+                        .field("error", e.to_string()));
                 }
 
                 active_tasks.fetch_sub(1, Ordering::Relaxed);
+                metrics.lock().unwrap().task_completed(
+                    result.success, 
+                    elapsed, 
+                    result.records_processed
+                );
                 
                 if result.success {
-                    println!("[TASK] OK: {} registros procesados", result.records_processed);
-                    if !result.shuffle_outputs.is_empty() {
-                        println!("[TASK] Shuffle outputs: {}", result.shuffle_outputs.len());
-                    }
+                    task_log.emit(task_log.info("Tarea completada")
+                        .field("task_id", task.id.to_string())
+                        .field("records", result.records_processed)
+                        .field("latency_ms", format!("{:.1}", elapsed.as_secs_f64() * 1000.0)));
                 } else {
-                    println!("[TASK] ERROR: {:?}", result.error);
+                    task_log.emit(task_log.error("Tarea fallida")
+                        .field("task_id", task.id.to_string())
+                        .field("error", result.error.as_deref().unwrap_or("unknown")));
                 }
             }
             Ok(res) if res.status() == reqwest::StatusCode::NO_CONTENT => {
                 tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_NO_TASK_MS)).await;
             }
             Ok(res) if res.status() == reqwest::StatusCode::FORBIDDEN => {
-                println!("[WORKER] Rechazado por master - posiblemente marcado DOWN");
+                log.emit(log.warn("Rechazado por master - posiblemente marcado DOWN"));
                 tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_ERROR_SECS)).await;
             }
             _ => {
@@ -169,7 +240,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn execute_task_with_failure_simulation(task: &Task, fail_probability: u32, cache: &SharedCache) -> TaskResult {
-    // Simular fallo aleatorio si está habilitado
     if fail_probability > 0 {
         let random: u32 = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -177,7 +247,6 @@ fn execute_task_with_failure_simulation(task: &Task, fail_probability: u32, cach
             .subsec_nanos()) % 100;
         
         if random < fail_probability {
-            println!("[TASK] FALLO SIMULADO para tarea {}", task.id);
             return TaskResult {
                 task_id: task.id,
                 job_id: task.job_id,
@@ -203,11 +272,9 @@ fn execute_task(task: &Task, cache: &SharedCache) -> TaskResult {
 
     match operators::execute_operator(task, cache) {
         Ok(result) => {
-            // Guardar resultado en cache
             let cache_key = format!("{}:{}:{}", task.job_id, task.node_id, task.partition_id);
             cache.lock().unwrap().put(cache_key, result.partition.clone());
             
-            // Guardar resultado a disco (excepto shuffle_write que ya guardó)
             if task.op != "shuffle_write" {
                 if let Err(e) = operators::write_partition(&output_path, &result.partition) {
                     return TaskResult {

@@ -1,7 +1,12 @@
 // common/src/lib.rs
 
+pub mod logging;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+// Re-exportar logging
+pub use logging::{LogEntry, LogLevel, Logger};
 
 // ============ Registro de datos ============
 
@@ -26,7 +31,6 @@ pub struct DagNode {
     pub partitions: Option<u32>,
     pub fn_name: Option<String>,
     pub key: Option<String>,
-    // Para join: segundo input
     pub join_with: Option<String>,
 }
 
@@ -84,11 +88,8 @@ pub struct Task {
     pub fn_name: Option<String>,
     pub key: Option<String>,
     pub status: TaskStatus,
-    // Para shuffle: indica si debe leer de shuffle files
     pub is_shuffle_read: bool,
-    // Para join: paths del segundo dataset
     pub join_partitions: Vec<String>,
-    // Worker asignado (para replanificación)
     pub assigned_worker: Option<Uuid>,
 }
 
@@ -101,7 +102,6 @@ pub struct TaskResult {
     pub error: Option<String>,
     pub output_path: Option<String>,
     pub records_processed: u64,
-    // Paths de shuffle output (uno por partición destino)
     pub shuffle_outputs: Vec<String>,
 }
 
@@ -146,4 +146,23 @@ pub struct TaskStatusUpdate {
     pub task_id: Uuid,
     pub status: TaskStatus,
     pub result: Option<TaskResult>,
+}
+
+// ============ Métricas ============
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct JobMetrics {
+    pub job_id: String,
+    pub name: String,
+    pub status: String,
+    pub start_time: u64,
+    pub end_time: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub total_tasks: u32,
+    pub completed_tasks: u32,
+    pub failed_tasks: u32,
+    pub total_records: u64,
+    pub stages_completed: u32,
+    pub total_stages: u32,
+    pub throughput_records_per_sec: f64,
 }
