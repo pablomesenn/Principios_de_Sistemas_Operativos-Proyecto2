@@ -1,5 +1,6 @@
 // worker/src/operators.rs
 
+use crate::cache::SharedCache;
 use common::{Partition, Record, Task};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -10,6 +11,7 @@ const DATA_DIR: &str = "/tmp/minispark";
 
 pub fn ensure_data_dir() {
     fs::create_dir_all(DATA_DIR).ok();
+    fs::create_dir_all(format!("{}/spill", DATA_DIR)).ok();
 }
 
 pub fn output_path(job_id: &str, node_id: &str, partition_id: u32) -> String {
@@ -49,17 +51,17 @@ pub struct ExecutionResult {
     pub shuffle_outputs: Vec<String>,
 }
 
-pub fn execute_operator(task: &Task) -> Result<ExecutionResult, String> {
+pub fn execute_operator(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
     match task.op.as_str() {
         "read_csv" => op_read_csv(task),
         "read_jsonl" => op_read_jsonl(task),
-        "map" => op_map(task),
-        "filter" => op_filter(task),
-        "flat_map" => op_flat_map(task),
-        "reduce_by_key" => op_reduce_by_key(task),
-        "shuffle_write" => op_shuffle_write(task),
+        "map" => op_map(task, cache),
+        "filter" => op_filter(task, cache),
+        "flat_map" => op_flat_map(task, cache),
+        "reduce_by_key" => op_reduce_by_key(task, cache),
+        "shuffle_write" => op_shuffle_write(task, cache),
         "shuffle_read" => op_shuffle_read(task),
-        "join" => op_join(task),
+        "join" => op_join(task, cache),
         other => Err(format!("Operador desconocido: {}", other)),
     }
 }
@@ -114,7 +116,6 @@ fn op_read_jsonl(task: &Task) -> Result<ExecutionResult, String> {
         let line = line.map_err(|e| format!("Error leyendo línea: {}", e))?;
         
         if line_num % task.total_partitions == task.partition_id {
-            // Parsear JSON y extraer campos
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                 let value = json.to_string();
                 let key = json.get("key")
@@ -135,8 +136,8 @@ fn op_read_jsonl(task: &Task) -> Result<ExecutionResult, String> {
     })
 }
 
-fn op_map(task: &Task) -> Result<ExecutionResult, String> {
-    let input = load_input_partitions(task)?;
+fn op_map(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
+    let input = load_input_partitions(task, cache)?;
     let fn_name = task.fn_name.as_deref().unwrap_or("identity");
     
     let records: Vec<Record> = input.records.into_iter()
@@ -151,8 +152,8 @@ fn op_map(task: &Task) -> Result<ExecutionResult, String> {
     })
 }
 
-fn op_filter(task: &Task) -> Result<ExecutionResult, String> {
-    let input = load_input_partitions(task)?;
+fn op_filter(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
+    let input = load_input_partitions(task, cache)?;
     let fn_name = task.fn_name.as_deref().unwrap_or("not_empty");
     
     let records: Vec<Record> = input.records.into_iter()
@@ -167,8 +168,8 @@ fn op_filter(task: &Task) -> Result<ExecutionResult, String> {
     })
 }
 
-fn op_flat_map(task: &Task) -> Result<ExecutionResult, String> {
-    let input = load_input_partitions(task)?;
+fn op_flat_map(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
+    let input = load_input_partitions(task, cache)?;
     let fn_name = task.fn_name.as_deref().unwrap_or("split_words");
     
     let records: Vec<Record> = input.records.into_iter()
@@ -183,11 +184,11 @@ fn op_flat_map(task: &Task) -> Result<ExecutionResult, String> {
     })
 }
 
-fn op_reduce_by_key(task: &Task) -> Result<ExecutionResult, String> {
+fn op_reduce_by_key(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
     let input = if task.is_shuffle_read {
         load_shuffle_inputs(task)?
     } else {
-        load_input_partitions(task)?
+        load_input_partitions(task, cache)?
     };
     
     let fn_name = task.fn_name.as_deref().unwrap_or("sum");
@@ -213,25 +214,21 @@ fn op_reduce_by_key(task: &Task) -> Result<ExecutionResult, String> {
     })
 }
 
-/// Shuffle write: particiona datos por hash de clave
-fn op_shuffle_write(task: &Task) -> Result<ExecutionResult, String> {
-    let input = load_input_partitions(task)?;
+fn op_shuffle_write(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
+    let input = load_input_partitions(task, cache)?;
     let total_partitions = task.total_partitions;
     
-    // Crear buckets por partición destino
     let mut buckets: HashMap<u32, Vec<Record>> = HashMap::new();
     for i in 0..total_partitions {
         buckets.insert(i, Vec::new());
     }
     
-    // Distribuir registros por hash de clave
     for record in input.records {
         let key = record.key.as_deref().unwrap_or("");
         let target_partition = hash_key(key, total_partitions);
         buckets.get_mut(&target_partition).unwrap().push(record);
     }
     
-    // Escribir cada bucket a archivo
     let mut shuffle_outputs = Vec::new();
     let mut total_records = 0u64;
     
@@ -256,7 +253,6 @@ fn op_shuffle_write(task: &Task) -> Result<ExecutionResult, String> {
     })
 }
 
-/// Shuffle read: lee todos los shuffle files destinados a esta partición
 fn op_shuffle_read(task: &Task) -> Result<ExecutionResult, String> {
     let partition = load_shuffle_inputs(task)?;
     let count = partition.records.len() as u64;
@@ -268,22 +264,16 @@ fn op_shuffle_read(task: &Task) -> Result<ExecutionResult, String> {
     })
 }
 
-/// Join: combina dos datasets por clave
-fn op_join(task: &Task) -> Result<ExecutionResult, String> {
-    // Cargar dataset izquierdo
-    let left = load_input_partitions(task)?;
+fn op_join(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
+    let left = load_input_partitions(task, cache)?;
+    let right = load_join_partitions(task, cache)?;
     
-    // Cargar dataset derecho
-    let right = load_join_partitions(task)?;
-    
-    // Indexar derecho por clave
     let mut right_index: HashMap<String, Vec<String>> = HashMap::new();
     for record in right.records {
         let key = record.key.unwrap_or_default();
         right_index.entry(key).or_default().push(record.value);
     }
     
-    // Hacer join
     let mut records = Vec::new();
     for left_record in left.records {
         let key = left_record.key.clone().unwrap_or_default();
@@ -308,10 +298,21 @@ fn op_join(task: &Task) -> Result<ExecutionResult, String> {
 
 // ============ Funciones auxiliares ============
 
-fn load_input_partitions(task: &Task) -> Result<Partition, String> {
+/// Cargar particiones de input, intentando primero del cache
+fn load_input_partitions(task: &Task, cache: &SharedCache) -> Result<Partition, String> {
     let mut all_records = Vec::new();
     
     for path in &task.input_partitions {
+        // Intentar extraer cache key del path
+        if let Some(cache_key) = path_to_cache_key(path, &task.job_id.to_string()) {
+            let mut cache_guard = cache.lock().unwrap();
+            if let Some(cached) = cache_guard.get(&cache_key) {
+                all_records.extend(cached.records);
+                continue;
+            }
+        }
+        
+        // Fallback: leer de disco
         let partition = read_partition(path)?;
         all_records.extend(partition.records);
     }
@@ -322,8 +323,7 @@ fn load_input_partitions(task: &Task) -> Result<Partition, String> {
 fn load_shuffle_inputs(task: &Task) -> Result<Partition, String> {
     let mut all_records = Vec::new();
     
-    // Buscar todos los shuffle files destinados a esta partición
-    let pattern = format!("_shuffle_p");
+    let pattern = "_shuffle_p";
     let target = format!("_to_p{}.json", task.partition_id);
     
     if let Ok(entries) = fs::read_dir(DATA_DIR) {
@@ -333,9 +333,8 @@ fn load_shuffle_inputs(task: &Task) -> Result<Partition, String> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             
-            // Verificar que es del job correcto y destino correcto
             if filename.contains(&task.job_id.to_string()) 
-                && filename.contains(&pattern)
+                && filename.contains(pattern)
                 && filename.ends_with(&target) 
             {
                 let partition = read_partition(path.to_str().unwrap())?;
@@ -347,15 +346,51 @@ fn load_shuffle_inputs(task: &Task) -> Result<Partition, String> {
     Ok(Partition { records: all_records })
 }
 
-fn load_join_partitions(task: &Task) -> Result<Partition, String> {
+fn load_join_partitions(task: &Task, cache: &SharedCache) -> Result<Partition, String> {
     let mut all_records = Vec::new();
     
     for path in &task.join_partitions {
+        // Intentar cache primero
+        if let Some(cache_key) = path_to_cache_key(path, &task.job_id.to_string()) {
+            let mut cache_guard = cache.lock().unwrap();
+            if let Some(cached) = cache_guard.get(&cache_key) {
+                all_records.extend(cached.records);
+                continue;
+            }
+        }
+        
         let partition = read_partition(path)?;
         all_records.extend(partition.records);
     }
     
     Ok(Partition { records: all_records })
+}
+
+/// Convertir path de archivo a cache key
+fn path_to_cache_key(path: &str, job_id: &str) -> Option<String> {
+    // Path format: /tmp/minispark/{job_id}_{node_id}_p{partition}.json
+    let filename = path.rsplit('/').next()?;
+    let prefix = format!("{}_", job_id);
+    let rest = filename.strip_prefix(&prefix)?;
+    
+    // Buscar "_p" seguido de dígito
+    let mut last_p_pos = None;
+    let chars: Vec<char> = rest.chars().collect();
+    
+    for i in 0..chars.len().saturating_sub(2) {
+        if chars[i] == '_' && chars[i + 1] == 'p' && chars.get(i + 2).map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            last_p_pos = Some(i);
+        }
+    }
+    
+    let p_pos = last_p_pos?;
+    let node_id = &rest[..p_pos];
+    
+    // Extraer partition_id
+    let partition_str = &rest[p_pos + 2..];
+    let partition_id: u32 = partition_str.strip_suffix(".json")?.parse().ok()?;
+    
+    Some(format!("{}:{}:{}", job_id, node_id, partition_id))
 }
 
 fn hash_key(key: &str, num_partitions: u32) -> u32 {
@@ -381,7 +416,6 @@ fn apply_map_fn(fn_name: &str, record: Record) -> Record {
             value: "1".to_string(),
         },
         "extract_key" => {
-            // Extrae primera columna como key, resto como value
             let parts: Vec<&str> = record.value.splitn(2, ',').collect();
             Record {
                 key: Some(parts[0].to_string()),

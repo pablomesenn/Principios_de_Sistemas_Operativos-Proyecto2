@@ -1,7 +1,9 @@
 // worker/src/main.rs
 
+mod cache;
 mod operators;
 
+use cache::{new_shared_cache, SharedCache};
 use common::{Heartbeat, Task, TaskResult, WorkerRegistration};
 use reqwest::Client;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -9,11 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-// Configuración de tolerancia a fallos
+// Configuración
 const HEARTBEAT_INTERVAL_SECS: u64 = 2;
 const POLL_INTERVAL_MS: u64 = 100;
 const POLL_INTERVAL_NO_TASK_MS: u64 = 200;
 const POLL_INTERVAL_ERROR_SECS: u64 = 1;
+const CACHE_STATS_INTERVAL_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +29,6 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap_or(9000);
     
-    // Probabilidad de fallo simulado (0-100)
     let fail_probability: u32 = std::env::var("FAIL_PROBABILITY")
         .unwrap_or_else(|_| "0".into())
         .parse()
@@ -39,6 +41,9 @@ async fn main() -> anyhow::Result<()> {
         println!("MODO TEST: Probabilidad de fallo simulado: {}%", fail_probability);
     }
     println!();
+
+    // Inicializar cache
+    let cache = new_shared_cache();
 
     let reg = WorkerRegistration {
         id: Uuid::nil(),
@@ -83,6 +88,24 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Reporte periódico de estadísticas del cache
+    let stats_cache = cache.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(CACHE_STATS_INTERVAL_SECS)).await;
+            let stats = stats_cache.lock().unwrap().stats();
+            println!("[CACHE] Stats: {:.1}MB/{:.1}MB usado, {} en memoria, {} en disco, hits={}, misses={}, spills={}",
+                stats.current_memory_mb,
+                stats.max_memory_mb,
+                stats.cached_partitions,
+                stats.spilled_partitions,
+                stats.hits,
+                stats.misses,
+                stats.spills
+            );
+        }
+    });
+
     // Loop principal
     loop {
         let task_result = client
@@ -108,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
                 
                 active_tasks.fetch_add(1, Ordering::Relaxed);
 
-                let result = execute_task_with_failure_simulation(&task, fail_probability);
+                let result = execute_task_with_failure_simulation(&task, fail_probability, &cache);
 
                 let send_result = client
                     .post(format!("{}/api/v1/workers/task/complete", master_url))
@@ -145,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn execute_task_with_failure_simulation(task: &Task, fail_probability: u32) -> TaskResult {
+fn execute_task_with_failure_simulation(task: &Task, fail_probability: u32, cache: &SharedCache) -> TaskResult {
     // Simular fallo aleatorio si está habilitado
     if fail_probability > 0 {
         let random: u32 = (std::time::SystemTime::now()
@@ -168,19 +191,23 @@ fn execute_task_with_failure_simulation(task: &Task, fail_probability: u32) -> T
         }
     }
 
-    execute_task(task)
+    execute_task(task, cache)
 }
 
-fn execute_task(task: &Task) -> TaskResult {
+fn execute_task(task: &Task, cache: &SharedCache) -> TaskResult {
     let output_path = operators::output_path(
         &task.job_id.to_string(),
         &task.node_id,
         task.partition_id,
     );
 
-    match operators::execute_operator(task) {
+    match operators::execute_operator(task, cache) {
         Ok(result) => {
-            // Guardar resultado (excepto shuffle_write que ya guardó)
+            // Guardar resultado en cache
+            let cache_key = format!("{}:{}:{}", task.job_id, task.node_id, task.partition_id);
+            cache.lock().unwrap().put(cache_key, result.partition.clone());
+            
+            // Guardar resultado a disco (excepto shuffle_write que ya guardó)
             if task.op != "shuffle_write" {
                 if let Err(e) = operators::write_partition(&output_path, &result.partition) {
                     return TaskResult {
