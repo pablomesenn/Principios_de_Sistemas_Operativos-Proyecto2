@@ -15,7 +15,9 @@ test:
 # Limpiar artefactos
 clean:
 	cargo clean
-	rm -rf /tmp/minispark
+
+delete:
+	rm -rf C:/tmp/minispark/*
 
 # Ejecutar master
 run-master:
@@ -71,6 +73,18 @@ test-cache: build
 test-metrics: build
 	chmod +x scripts/test_metrics.sh
 	./scripts/test_metrics.sh
+
+test-load-balancing: build
+	chmod +x scripts/test_load_balancing.sh
+	./scripts/test_load_balancing.sh
+
+test-parallel-tasks: build
+	chmod +x scripts/test_parallel_tasks.sh
+	./scripts/test_parallel_tasks.sh
+
+test-failures: build
+	chmod +x scripts/test_failures.sh
+	./scripts/test_failures.sh
 
 # Métricas - Master
 metrics-system:

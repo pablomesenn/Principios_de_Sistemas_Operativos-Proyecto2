@@ -22,7 +22,6 @@ const METRICS_REPORT_INTERVAL_SECS: u64 = 30;
 
 // Límites por tarea
 const MAX_TASK_TIME_SECS: u64 = 5; // tiempo máximo por tarea
-const MAX_TASK_OUTPUT_MB: usize = 32; // tamaño máximo aproximado de salida por tarea
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,9 +31,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Número de hilos configurables
     let worker_threads: usize = std::env::var("WORKER_THREADS")
-        .unwrap_or_else(|_| "4".into())
+        .unwrap_or_else(|_| "9".into())
         .parse()
-        .unwrap_or(4);
+        .unwrap_or(9);
 
     let client = Client::new();
     let master_url = std::env::var("MASTER_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
