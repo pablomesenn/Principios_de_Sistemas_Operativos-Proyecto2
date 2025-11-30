@@ -17,6 +17,15 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum MetricsMode {
+    System,
+    Jobs,
+    Failures,
+    Job { id: String },
+    Stages { id: String },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Enviar job wordcount
     Submit {
@@ -42,6 +51,10 @@ enum Commands {
     Status { id: Uuid },
     /// Obtener resultados
     Results { id: Uuid },
+    Metrics {
+        #[command(subcommand)]
+        mode: MetricsMode,
+    },
 }
 
 #[tokio::main]
@@ -50,11 +63,20 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::new();
 
     match cli.command {
-        Commands::Submit { name, parallelism, input } => {
+        Commands::Submit {
+            name,
+            parallelism,
+            input,
+        } => {
             let dag = create_wordcount_dag(&input, parallelism);
             submit_job(&client, &cli.master, name, dag, parallelism).await?;
         }
-        Commands::SubmitJoin { name, parallelism, sales, products } => {
+        Commands::SubmitJoin {
+            name,
+            parallelism,
+            sales,
+            products,
+        } => {
             let dag = create_join_dag(&sales, &products, parallelism);
             submit_job(&client, &cli.master, name, dag, parallelism).await?;
         }
@@ -64,6 +86,33 @@ async fn main() -> anyhow::Result<()> {
         Commands::Results { id } => {
             get_results(&client, &cli.master, id).await?;
         }
+        Commands::Metrics { mode } => match mode {
+            MetricsMode::System => {
+                let url = format!("{}/api/v1/metrics/system", &cli.master);
+                let res = client.get(&url).send().await?;
+                println!("{}", res.text().await?);
+            }
+            MetricsMode::Jobs => {
+                let url = format!("{}/api/v1/metrics/jobs", &cli.master);
+                let res = client.get(&url).send().await?;
+                println!("{}", res.text().await?);
+            }
+            MetricsMode::Failures => {
+                let url = format!("{}/api/v1/metrics/failures", &cli.master);
+                let res = client.get(&url).send().await?;
+                println!("{}", res.text().await?);
+            }
+            MetricsMode::Job { id } => {
+                let url = format!("{}/api/v1/jobs/{}/metrics", &cli.master, id);
+                let res = client.get(&url).send().await?;
+                println!("{}", res.text().await?);
+            }
+            MetricsMode::Stages { id } => {
+                let url = format!("{}/api/v1/jobs/{}/stages", &cli.master, id);
+                let res = client.get(&url).send().await?;
+                println!("{}", res.text().await?);
+            }
+        },
     }
 
     Ok(())
@@ -76,7 +125,11 @@ async fn submit_job(
     dag: Dag,
     parallelism: u32,
 ) -> anyhow::Result<()> {
-    let job = JobRequest { name, dag, parallelism };
+    let job = JobRequest {
+        name,
+        dag,
+        parallelism,
+    };
 
     let res = client
         .post(format!("{}/api/v1/jobs", master))

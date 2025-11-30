@@ -86,6 +86,10 @@ test-failures: build
 	chmod +x scripts/test_failures.sh
 	./scripts/test_failures.sh
 
+test-client-metrics: build
+	chmod +x scripts/test_client_metrics.sh
+	./scripts/test_client_metrics.sh
+
 # Métricas - Master
 metrics-system:
 	@curl -s http://127.0.0.1:8080/api/v1/metrics/system | python3 -m json.tool
