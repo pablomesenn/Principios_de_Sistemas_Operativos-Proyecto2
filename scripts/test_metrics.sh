@@ -61,7 +61,7 @@ echo -e "${GREEN}=== TEST 1: Métricas del sistema ===${NC}"
 echo ""
 
 echo "Métricas del sistema (antes del job):"
-curl -s http://127.0.0.1:8080/api/v1/metrics/system | python3 -m json.tool
+curl -s http://127.0.0.1:8080/api/v1/metrics/system | python -m json.tool
 echo ""
 
 # === TEST 2: Enviar job y ver métricas ===
@@ -84,12 +84,12 @@ echo ""
 for i in {1..30}; do
     sleep 1
     STATUS=$(./target/release/client status "$JOB_ID" 2>&1)
-    
+
     if echo "$STATUS" | grep -q "Succeeded"; then
         echo "$STATUS"
         break
     fi
-    
+
     if echo "$STATUS" | grep -q "Failed"; then
         echo "$STATUS"
         echo -e "${RED}Job falló${NC}"
@@ -103,7 +103,7 @@ echo -e "${GREEN}=== TEST 3: Métricas del job ===${NC}"
 echo ""
 
 echo "Métricas del job:"
-curl -s "http://127.0.0.1:8080/api/v1/jobs/$JOB_ID/metrics" | python3 -m json.tool
+curl -s "http://127.0.0.1:8080/api/v1/jobs/$JOB_ID/metrics" | python -m json.tool
 echo ""
 
 # === TEST 4: Estadísticas de etapas ===
@@ -111,7 +111,7 @@ echo -e "${GREEN}=== TEST 4: Estadísticas de etapas ===${NC}"
 echo ""
 
 echo "Estadísticas por etapa:"
-curl -s "http://127.0.0.1:8080/api/v1/jobs/$JOB_ID/stages" | python3 -m json.tool
+curl -s "http://127.0.0.1:8080/api/v1/jobs/$JOB_ID/stages" | python -m json.tool
 echo ""
 
 # === TEST 5: Métricas de todos los jobs ===
@@ -119,7 +119,7 @@ echo -e "${GREEN}=== TEST 5: Métricas de todos los jobs ===${NC}"
 echo ""
 
 echo "Métricas de todos los jobs:"
-curl -s http://127.0.0.1:8080/api/v1/metrics/jobs | python3 -m json.tool
+curl -s http://127.0.0.1:8080/api/v1/metrics/jobs | python -m json.tool
 echo ""
 
 # === TEST 6: Métricas del worker ===
@@ -127,7 +127,7 @@ echo -e "${GREEN}=== TEST 6: Métricas del worker ===${NC}"
 echo ""
 
 echo "Métricas del worker (puerto 10000):"
-curl -s http://127.0.0.1:10000/metrics 2>/dev/null | python3 -m json.tool || echo "(Worker metrics endpoint no disponible)"
+curl -s http://127.0.0.1:10000/metrics 2>/dev/null | python -m json.tool || echo "(Worker metrics endpoint no disponible)"
 echo ""
 
 # === TEST 7: Métricas del sistema actualizadas ===
@@ -135,7 +135,7 @@ echo -e "${GREEN}=== TEST 7: Métricas del sistema (después del job) ===${NC}"
 echo ""
 
 echo "Métricas del sistema:"
-curl -s http://127.0.0.1:8080/api/v1/metrics/system | python3 -m json.tool
+curl -s http://127.0.0.1:8080/api/v1/metrics/system | python -m json.tool
 echo ""
 
 # Resumen
