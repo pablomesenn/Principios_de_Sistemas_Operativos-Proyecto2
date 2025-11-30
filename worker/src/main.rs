@@ -5,7 +5,7 @@ mod metrics;
 mod operators;
 
 use cache::{new_shared_cache, SharedCache};
-use common::{Heartbeat, Logger, Task, TaskResult, WorkerRegistration};
+use common::{Heartbeat, Logger, Partition, Task, TaskResult, WorkerRegistration};
 use metrics::{new_shared_metrics, SharedMetrics};
 use reqwest::Client;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -19,6 +19,10 @@ const POLL_INTERVAL_MS: u64 = 100;
 const POLL_INTERVAL_NO_TASK_MS: u64 = 200;
 const POLL_INTERVAL_ERROR_SECS: u64 = 1;
 const METRICS_REPORT_INTERVAL_SECS: u64 = 30;
+
+// Límites por tarea
+const MAX_TASK_TIME_SECS: u64 = 5; // tiempo máximo por tarea
+const MAX_TASK_OUTPUT_MB: usize = 32; // tamaño máximo aproximado de salida por tarea
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -238,8 +242,19 @@ async fn executor_loop(
                 metrics.lock().unwrap().task_started();
 
                 let start = Instant::now();
-                let result = execute_task_with_failure_simulation(&task, fail_probability, &cache);
+                let mut result =
+                    execute_task_with_failure_simulation(&task, fail_probability, &cache);
                 let elapsed = start.elapsed();
+
+                if elapsed > Duration::from_secs(MAX_TASK_TIME_SECS) {
+                    result.success = false;
+                    result.error = Some(format!(
+                        "Tarea superó el límite de tiempo de {}s (duró {:.3}s)",
+                        MAX_TASK_TIME_SECS,
+                        elapsed.as_secs_f64(),
+                    ));
+                    result.records_processed = 0;
+                }
 
                 let _ = client
                     .post(format!("{}/api/v1/workers/task/complete", master_url))
