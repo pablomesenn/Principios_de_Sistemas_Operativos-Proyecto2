@@ -31,7 +31,7 @@ cargo build --release
 # =============================
 # 2. Preparar dataset
 # =============================
-rm -rf /tmp/minispark/*
+rm -rf C:/tmp/minispark
 mkdir -p data
 
 echo "word" > data/metrics_cli.csv

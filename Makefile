@@ -16,7 +16,7 @@ clean:
 	cargo clean
 
 delete:
-	rm -rf /tmp/minispark/*
+	rm -rf C:/tmp/minispark
 
 # ============ Ejecución Local ============
 
@@ -144,6 +144,18 @@ test-failures: build
 test-client-metrics: build
 	chmod +x scripts/test_client_metrics.sh
 	./scripts/test_client_metrics.sh
+
+test-single-node: build
+	chmod +x scripts/test_single_node.sh
+	./scripts/test_single_node.sh
+
+test-e2e-multinode-join: build
+	chmod +x scripts/test_e2e_multinode_join.sh
+	./scripts/test_e2e_multinode_join.sh
+
+test-e2e-multinode-wc: build
+	chmod +x scripts/test_e2e_multinode_wc.sh
+	./scripts/test_e2e_multinode_wc.sh
 
 # ============ Métricas - Master ============
 
