@@ -1,0 +1,44 @@
+# .dockerignore
+# Excluir archivos innecesarios del contexto de Docker
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentación y archivos no necesarios
+docs/
+*.md
+*.pdf
+*.txt
+LICENSE
+
+# Scripts de test (no necesarios en imagen)
+scripts/
+test_*.sh
+
+# Datos de prueba locales (se montan como volumen)
+# data/
+
+# Archivos temporales
+/tmp/
+*.log
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python (si hay)
+__pycache__/
+*.py
+*.pyc

@@ -18,7 +18,10 @@ use persistence::PersistenceManager;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -30,6 +33,145 @@ const MONITOR_INTERVAL_SECS: u64 = 5;
 const RETRY_INTERVAL_SECS: u64 = 2;
 const PERSISTENCE_INTERVAL_SECS: u64 = 10;
 
+// ============ Planificador Round-Robin ============
+/// Planificador con Round-Robin y awareness de carga
+struct Scheduler {
+    /// Índice rotativo para round-robin
+    next_worker_index: AtomicUsize,
+    /// Lista ordenada de worker IDs para iteración consistente
+    worker_order: Mutex<Vec<Uuid>>,
+    /// Umbral máximo de diferencia de carga permitida
+    max_load_diff: u32,
+}
+
+impl Scheduler {
+    fn new() -> Self {
+        Self {
+            next_worker_index: AtomicUsize::new(0),
+            worker_order: Mutex::new(Vec::new()),
+            max_load_diff: 2, // Permitir hasta 2 tareas de diferencia
+        }
+    }
+
+    /// Registrar nuevo worker en el orden de round-robin
+    fn register_worker(&self, worker_id: Uuid) {
+        let mut order = self.worker_order.lock().unwrap();
+        if !order.contains(&worker_id) {
+            order.push(worker_id);
+        }
+    }
+
+    /// Eliminar worker del orden (cuando se marca DOWN permanentemente)
+    fn unregister_worker(&self, worker_id: Uuid) {
+        let mut order = self.worker_order.lock().unwrap();
+        order.retain(|&id| id != worker_id);
+    }
+
+    /// Seleccionar siguiente worker usando Round-Robin con awareness de carga
+    /// Retorna Some(worker_id) si hay un worker disponible, None si no
+    fn select_worker(&self, workers: &HashMap<Uuid, WorkerInfo>) -> Option<Uuid> {
+        let order = self.worker_order.lock().unwrap();
+        
+        if order.is_empty() {
+            return None;
+        }
+
+        // Obtener workers activos (UP) con sus cargas
+        let active_workers: Vec<(Uuid, u32)> = order
+            .iter()
+            .filter_map(|id| {
+                workers.get(id).and_then(|w| {
+                    if w.status == WorkerStatus::Up {
+                        Some((*id, w.active_tasks))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        if active_workers.is_empty() {
+            return None;
+        }
+
+        // Encontrar carga mínima
+        let min_load = active_workers.iter().map(|(_, load)| *load).min().unwrap_or(0);
+
+        // Filtrar workers que están dentro del umbral de carga aceptable
+        let eligible_workers: Vec<Uuid> = active_workers
+            .iter()
+            .filter(|(_, load)| *load <= min_load + self.max_load_diff)
+            .map(|(id, _)| *id)
+            .collect();
+
+        if eligible_workers.is_empty() {
+            return None;
+        }
+
+        // Round-robin entre los workers elegibles
+        let current_index = self.next_worker_index.fetch_add(1, Ordering::SeqCst);
+        let selected_index = current_index % eligible_workers.len();
+        
+        Some(eligible_workers[selected_index])
+    }
+
+    /// Verificar si un worker específico puede recibir tarea (para pull-based)
+    fn can_worker_receive_task(&self, worker_id: Uuid, workers: &HashMap<Uuid, WorkerInfo>) -> bool {
+        let worker = match workers.get(&worker_id) {
+            Some(w) if w.status == WorkerStatus::Up => w,
+            _ => return false,
+        };
+
+        // Obtener carga mínima entre todos los workers activos
+        let min_load = workers
+            .values()
+            .filter(|w| w.status == WorkerStatus::Up)
+            .map(|w| w.active_tasks)
+            .min()
+            .unwrap_or(0);
+
+        // Permitir si la carga del worker está dentro del umbral
+        worker.active_tasks <= min_load + self.max_load_diff
+    }
+
+    /// Obtener estadísticas del planificador
+    fn get_stats(&self, workers: &HashMap<Uuid, WorkerInfo>) -> SchedulerStats {
+        let order = self.worker_order.lock().unwrap();
+        
+        let active_count = order
+            .iter()
+            .filter(|id| {
+                workers
+                    .get(*id)
+                    .map(|w| w.status == WorkerStatus::Up)
+                    .unwrap_or(false)
+            })
+            .count();
+
+        let total_load: u32 = workers
+            .values()
+            .filter(|w| w.status == WorkerStatus::Up)
+            .map(|w| w.active_tasks)
+            .sum();
+
+        SchedulerStats {
+            total_workers: order.len(),
+            active_workers: active_count,
+            total_load,
+            next_index: self.next_worker_index.load(Ordering::SeqCst),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SchedulerStats {
+    total_workers: usize,
+    active_workers: usize,
+    total_load: u32,
+    next_index: usize,
+}
+
+// ============ Estado de la Aplicación ============
 #[derive(Clone)]
 struct AppState {
     workers: Arc<Mutex<HashMap<Uuid, WorkerInfo>>>,
@@ -44,6 +186,7 @@ struct AppState {
     failure_counts: Arc<Mutex<HashMap<Uuid, u32>>>,
     persistence: PersistenceManager,
     job_metrics: SharedJobMetrics,
+    scheduler: Arc<Scheduler>,
 }
 
 impl AppState {
@@ -61,6 +204,7 @@ impl AppState {
             failure_counts: Arc::new(Mutex::new(HashMap::new())),
             persistence: PersistenceManager::new(),
             job_metrics: new_shared_job_metrics(),
+            scheduler: Arc::new(Scheduler::new()),
         }
     }
 }
@@ -73,7 +217,8 @@ async fn main() {
         log.info("Mini-Spark Master iniciando")
             .field("max_attempts", MAX_TASK_ATTEMPTS)
             .field("heartbeat_timeout", HEARTBEAT_TIMEOUT_SECS)
-            .field("persistence_interval", PERSISTENCE_INTERVAL_SECS),
+            .field("persistence_interval", PERSISTENCE_INTERVAL_SECS)
+            .field("scheduler", "round-robin + load-aware"),
     );
 
     let state = AppState::new();
@@ -110,6 +255,7 @@ async fn main() {
         .route("/api/v1/metrics/failures", get(get_failure_metrics))
         .route("/api/v1/metrics/jobs", get(get_all_job_metrics))
         .route("/api/v1/metrics/system", get(get_system_metrics))
+        .route("/api/v1/metrics/scheduler", get(get_scheduler_metrics))
         .route("/api/v1/state", get(get_persisted_state))
         .with_state(state);
 
@@ -150,6 +296,9 @@ async fn register_worker(
     };
 
     state.workers.lock().unwrap().insert(reg.id, worker_info);
+    
+    // Registrar en el planificador round-robin
+    state.scheduler.register_worker(reg.id);
 
     log.emit(
         log.info("Worker registrado")
@@ -184,36 +333,7 @@ async fn heartbeat(State(state): State<AppState>, Json(hb): Json<Heartbeat>) -> 
     }
 }
 
-fn can_assign_task_to_worker(worker_id: Uuid, state: &AppState) -> bool {
-    let workers = state.workers.lock().unwrap();
-
-    // Recolectar cargas de todos los workers UP
-    let mut loads: Vec<(Uuid, u32)> = workers
-        .iter()
-        .filter(|(_, w)| w.status == WorkerStatus::Up)
-        .map(|(id, w)| (*id, w.active_tasks))
-        .collect();
-
-    // Si no hay workers activos, no asignamos nada
-    if loads.is_empty() {
-        return false;
-    }
-
-    // Ordenar por carga para encontrar el mínimo
-    loads.sort_by_key(|(_, load)| *load);
-    let min_load = loads[0].1;
-
-    // Carga del worker que está pidiendo tarea
-    let this_load = workers
-        .get(&worker_id)
-        .map(|w| w.active_tasks)
-        .unwrap_or(u32::MAX);
-
-    drop(workers);
-
-    this_load <= min_load + 1
-}
-
+/// Asignar tarea a worker usando Round-Robin con awareness de carga
 async fn get_task_for_worker(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
@@ -223,6 +343,7 @@ async fn get_task_for_worker(
         .and_then(|s| Uuid::parse_str(s).ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
+    // Verificar que el worker esté activo
     {
         let workers = state.workers.lock().unwrap();
         match workers.get(&worker_id) {
@@ -231,12 +352,16 @@ async fn get_task_for_worker(
         }
     }
 
-    // Política de planificación
-    if !can_assign_task_to_worker(worker_id, &state) {
-        // Hay otros workers menos cargados: dejamos que ellos se lleven la siguiente tarea
-        return Err(StatusCode::NO_CONTENT);
+    // Verificar con el planificador si este worker puede recibir tarea
+    {
+        let workers = state.workers.lock().unwrap();
+        if !state.scheduler.can_worker_receive_task(worker_id, &workers) {
+            // Hay otros workers con menos carga, denegar
+            return Err(StatusCode::NO_CONTENT);
+        }
     }
 
+    // Buscar tarea disponible
     let mut queue = state.task_queue.lock().unwrap();
     let completed_nodes = state.completed_nodes.lock().unwrap();
     let completed_attempts = state.completed_attempts.lock().unwrap();
@@ -263,13 +388,14 @@ async fn get_task_for_worker(
             .unwrap()
             .insert(task.id, task.clone());
 
+        // Actualizar contador de tareas activas del worker
         if let Some(w) = state.workers.lock().unwrap().get_mut(&worker_id) {
             w.active_tasks += 1;
         }
 
-        let log = Logger::new("TASK");
+        let log = Logger::new("SCHEDULER");
         log.emit(
-            log.info("Tarea asignada")
+            log.info("Tarea asignada (Round-Robin)")
                 .field("task_id", task.id.to_string())
                 .field("op", &task.op)
                 .field("partition", task.partition_id)
@@ -291,6 +417,7 @@ async fn complete_task(
     let task_info = state.running_tasks.lock().unwrap().remove(&result.task_id);
 
     if let Some(task) = task_info {
+        // Decrementar contador de tareas activas del worker
         if let Some(worker_id) = task.assigned_worker {
             if let Some(w) = state.workers.lock().unwrap().get_mut(&worker_id) {
                 w.active_tasks = w.active_tasks.saturating_sub(1);
@@ -298,6 +425,8 @@ async fn complete_task(
         }
 
         let task_key = (task.job_id, task.node_id.clone(), task.partition_id);
+        
+        // Verificar idempotencia
         {
             let completed_attempts = state.completed_attempts.lock().unwrap();
             if let Some(&completed_attempt) = completed_attempts.get(&task_key) {
@@ -349,6 +478,7 @@ async fn complete_task(
                     .field("attempt", result.attempt),
             );
         } else {
+            // Incrementar contador de fallos
             *state
                 .failure_counts
                 .lock()
@@ -577,7 +707,22 @@ async fn get_system_metrics(
         serde_json::json!(running.len()),
     );
 
+    // Información de workers con carga
+    let worker_loads: HashMap<String, u32> = workers
+        .iter()
+        .map(|(id, w)| (id.to_string(), w.active_tasks))
+        .collect();
+    metrics.insert("worker_loads".to_string(), serde_json::json!(worker_loads));
+
     Json(metrics)
+}
+
+/// Endpoint para ver estadísticas del planificador Round-Robin
+async fn get_scheduler_metrics(
+    State(state): State<AppState>,
+) -> Json<SchedulerStats> {
+    let workers = state.workers.lock().unwrap();
+    Json(state.scheduler.get_stats(&workers))
 }
 
 async fn get_persisted_state(State(state): State<AppState>) -> Json<persistence::PersistedState> {

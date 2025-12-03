@@ -1,0 +1,180 @@
+# docker-compose.yml
+# Mini-Spark: Motor de Procesamiento Distribuido
+#
+# Uso:
+#   docker-compose build                    # Compilar imágenes
+#   docker-compose up -d master worker1 worker2   # Iniciar cluster
+#   docker-compose run client submit --input /data/input.csv
+#   docker-compose logs -f                  # Ver logs
+#   docker-compose down                     # Apagar cluster
+
+services:
+  # ============ Master/Coordinator ============
+  master:
+    build:
+      context: .
+      target: master
+    container_name: minispark-master
+    hostname: master
+    ports:
+      - "8080:8080"
+    volumes:
+      - minispark-state:/tmp/minispark/state
+      - ./data:/app/data:ro
+    environment:
+      - RUST_LOG=info
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=text
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - minispark-net
+    restart: unless-stopped
+
+  # ============ Worker 1 ============
+  worker1:
+    build:
+      context: .
+      target: worker
+    container_name: minispark-worker1
+    hostname: worker1
+    ports:
+      - "9000:9000"
+      - "10000:10000"
+    volumes:
+      - minispark-data:/tmp/minispark
+      - ./data:/app/data:ro
+    environment:
+      - MASTER_URL=http://master:8080
+      - WORKER_PORT=9000
+      - WORKER_THREADS=4
+      - CACHE_MAX_MB=128
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=text
+      - FAIL_PROBABILITY=0
+    depends_on:
+      master:
+        condition: service_healthy
+    networks:
+      - minispark-net
+    restart: unless-stopped
+
+  # ============ Worker 2 ============
+  worker2:
+    build:
+      context: .
+      target: worker
+    container_name: minispark-worker2
+    hostname: worker2
+    ports:
+      - "9001:9000"
+      - "10001:10000"
+    volumes:
+      - minispark-data:/tmp/minispark
+      - ./data:/app/data:ro
+    environment:
+      - MASTER_URL=http://master:8080
+      - WORKER_PORT=9000
+      - WORKER_THREADS=4
+      - CACHE_MAX_MB=128
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=text
+      - FAIL_PROBABILITY=0
+    depends_on:
+      master:
+        condition: service_healthy
+    networks:
+      - minispark-net
+    restart: unless-stopped
+
+  # ============ Worker 3 (opcional) ============
+  worker3:
+    build:
+      context: .
+      target: worker
+    container_name: minispark-worker3
+    hostname: worker3
+    ports:
+      - "9002:9000"
+      - "10002:10000"
+    volumes:
+      - minispark-data:/tmp/minispark
+      - ./data:/app/data:ro
+    environment:
+      - MASTER_URL=http://master:8080
+      - WORKER_PORT=9000
+      - WORKER_THREADS=4
+      - CACHE_MAX_MB=128
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=text
+      - FAIL_PROBABILITY=0
+    depends_on:
+      master:
+        condition: service_healthy
+    networks:
+      - minispark-net
+    profiles:
+      - full  # Solo se inicia con: docker-compose --profile full up
+
+  # ============ Worker con fallos simulados (para testing) ============
+  worker-flaky:
+    build:
+      context: .
+      target: worker
+    container_name: minispark-worker-flaky
+    hostname: worker-flaky
+    volumes:
+      - minispark-data:/tmp/minispark
+      - ./data:/app/data:ro
+    environment:
+      - MASTER_URL=http://master:8080
+      - WORKER_PORT=9000
+      - WORKER_THREADS=2
+      - CACHE_MAX_MB=64
+      - LOG_LEVEL=INFO
+      - FAIL_PROBABILITY=30
+    depends_on:
+      master:
+        condition: service_healthy
+    networks:
+      - minispark-net
+    profiles:
+      - test  # Solo se inicia con: docker-compose --profile test up
+
+  # ============ Cliente CLI ============
+  client:
+    build:
+      context: .
+      target: client
+    container_name: minispark-client
+    volumes:
+      - ./data:/app/data
+      - minispark-data:/tmp/minispark:ro
+    environment:
+      - MASTER_URL=http://master:8080
+    depends_on:
+      master:
+        condition: service_healthy
+    networks:
+      - minispark-net
+    profiles:
+      - tools  # No se inicia automáticamente
+
+# ============ Redes ============
+networks:
+  minispark-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# ============ Volúmenes ============
+volumes:
+  minispark-state:
+    driver: local
+  minispark-data:
+    driver: local

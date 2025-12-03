@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use uuid::Uuid;
 
 const STATE_DIR: &str = "/tmp/minispark/state";
 const JOBS_FILE: &str = "/tmp/minispark/state/jobs.json";

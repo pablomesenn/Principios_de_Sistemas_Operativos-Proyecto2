@@ -1,29 +1,28 @@
 .PHONY: build test clean run-master run-worker run-client demo test-fault-tolerance test-cache test-metrics
+.PHONY: docker-build docker-up docker-down docker-demo docker-test docker-logs docker-clean
 
-# Compilar todo
+# ============ Compilación Local ============
+
 build:
 	cargo build --release
 
-# Compilar en modo debug
 build-debug:
 	cargo build
 
-# Ejecutar tests
 test:
 	cargo test
 
-# Limpiar artefactos
 clean:
 	cargo clean
 
 delete:
-	rm -rf C:/tmp/minispark/*
+	rm -rf /tmp/minispark/*
 
-# Ejecutar master
+# ============ Ejecución Local ============
+
 run-master:
 	cargo run --release --bin master
 
-# Ejecutar worker
 # Variables: PORT, FAIL, CACHE, LOG_LEVEL (DEBUG/INFO/WARN/ERROR), LOG_FORMAT (text/json)
 run-worker:
 	WORKER_PORT=$(or $(PORT),9000) \
@@ -33,7 +32,6 @@ run-worker:
 	LOG_FORMAT=$(or $(LOG_FORMAT),text) \
 	cargo run --release --bin worker
 
-# Ejecutar cliente
 run-client-submit:
 	cargo run --release --bin client -- submit
 
@@ -46,7 +44,55 @@ run-client-status:
 run-client-results:
 	cargo run --release --bin client -- results $(ID)
 
-# Demo
+# ============ Docker ============
+
+docker-build:
+	docker-compose build
+
+docker-up:
+	docker-compose up -d master worker1 worker2
+
+docker-up-full:
+	docker-compose --profile full up -d
+
+docker-down:
+	docker-compose down
+
+docker-clean:
+	docker-compose down -v
+	docker rmi minispark-master minispark-worker minispark-client 2>/dev/null || true
+
+docker-logs:
+	docker-compose logs -f
+
+docker-ps:
+	docker-compose ps
+
+docker-demo:
+	chmod +x scripts/docker-demo.sh
+	./scripts/docker-demo.sh
+
+docker-test:
+	chmod +x scripts/docker-fault-test.sh
+	./scripts/docker-fault-test.sh
+
+docker-client-submit:
+	docker-compose run --rm client submit --input /app/data/input.csv --parallelism $(or $(P),4)
+
+docker-client-status:
+	docker-compose run --rm client status $(ID)
+
+docker-client-results:
+	docker-compose run --rm client results $(ID)
+
+docker-metrics-system:
+	@curl -s http://localhost:8080/api/v1/metrics/system | python3 -m json.tool
+
+docker-metrics-jobs:
+	@curl -s http://localhost:8080/api/v1/metrics/jobs | python3 -m json.tool
+
+# ============ Demo Local ============
+
 demo: build
 	@echo "=== Mini-Spark Demo ==="
 	@echo ""
@@ -60,8 +106,17 @@ demo: build
 	@echo "  FAIL=30 make run-worker            # 30% fallos simulados"
 	@echo "  LOG_LEVEL=DEBUG make run-worker    # Logs verbose"
 	@echo "  LOG_FORMAT=json make run-worker    # Logs en JSON"
+	@echo ""
+	@echo "=== Docker Demo ==="
+	@echo ""
+	@echo "  make docker-build                  # Construir imágenes"
+	@echo "  make docker-up                     # Iniciar cluster (2 workers)"
+	@echo "  make docker-demo                   # Demo completa automática"
+	@echo "  make docker-test                   # Test de tolerancia a fallos"
+	@echo "  make docker-down                   # Apagar cluster"
 
-# Tests
+# ============ Tests Locales ============
+
 test-fault-tolerance: build
 	chmod +x scripts/test_fault_tolerance.sh
 	./scripts/test_fault_tolerance.sh
@@ -90,7 +145,8 @@ test-client-metrics: build
 	chmod +x scripts/test_client_metrics.sh
 	./scripts/test_client_metrics.sh
 
-# Métricas - Master
+# ============ Métricas - Master ============
+
 metrics-system:
 	@curl -s http://127.0.0.1:8080/api/v1/metrics/system | python3 -m json.tool
 
@@ -117,7 +173,8 @@ state:
 state-file:
 	@cat /tmp/minispark/state/jobs.json | python3 -m json.tool
 
-# Formato de código
+# ============ Utilidades ============
+
 fmt:
 	cargo fmt
 
@@ -142,3 +199,51 @@ create-large-data:
 		echo "line $$i with some text data for testing" >> data/large.csv; \
 	done
 	@echo "Datos grandes creados en data/large.csv (10000 líneas)"
+
+create-1m-data:
+	mkdir -p data
+	echo "text" > data/benchmark_1m.csv
+	@echo "Generando 1M de líneas (esto puede tardar)..."
+	@for i in $$(seq 1 1000000); do \
+		echo "line $$i hello world foo bar baz test benchmark data" >> data/benchmark_1m.csv; \
+	done
+	@echo "Datos de benchmark creados en data/benchmark_1m.csv (1M líneas)"
+
+create-join-data:
+	mkdir -p data
+	echo "product_id,amount" > data/sales.csv
+	@for i in $$(seq 1 1000); do \
+		echo "$$((i % 100)),$$((RANDOM % 1000))" >> data/sales.csv; \
+	done
+	echo "product_id,name" > data/products.csv
+	@for i in $$(seq 0 99); do \
+		echo "$$i,Product_$$i" >> data/products.csv; \
+	done
+	@echo "Datos de join creados: data/sales.csv (1000 ventas), data/products.csv (100 productos)"
+
+# ============ Ayuda ============
+
+help:
+	@echo "Mini-Spark - Motor de Procesamiento Distribuido"
+	@echo ""
+	@echo "Comandos principales:"
+	@echo "  make build              Compilar proyecto"
+	@echo "  make demo               Mostrar instrucciones de uso"
+	@echo ""
+	@echo "Ejecución local:"
+	@echo "  make run-master         Iniciar master"
+	@echo "  make run-worker         Iniciar worker"
+	@echo "  make run-client-submit  Enviar job"
+	@echo ""
+	@echo "Docker:"
+	@echo "  make docker-build       Construir imágenes"
+	@echo "  make docker-up          Iniciar cluster"
+	@echo "  make docker-demo        Demo completa"
+	@echo "  make docker-test        Test tolerancia a fallos"
+	@echo "  make docker-down        Apagar cluster"
+	@echo ""
+	@echo "Tests:"
+	@echo "  make test               Ejecutar tests unitarios"
+	@echo "  make test-fault-tolerance"
+	@echo "  make test-cache"
+	@echo "  make test-metrics"
