@@ -9,11 +9,17 @@ use uuid::Uuid;
 #[command(name = "miniclient")]
 #[command(about = "Cliente CLI para mini-Spark")]
 struct Cli {
-    #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+    /// URL del master (también se puede configurar con MASTER_URL)
+    #[arg(short, long, default_value_t = get_default_master_url())]
     master: String,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Obtener URL del master desde variable de entorno o usar default
+fn get_default_master_url() -> String {
+    std::env::var("MASTER_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
 }
 
 #[derive(Subcommand)]
@@ -51,6 +57,7 @@ enum Commands {
     Status { id: Uuid },
     /// Obtener resultados
     Results { id: Uuid },
+    /// Ver métricas
     Metrics {
         #[command(subcommand)]
         mode: MetricsMode,
@@ -61,6 +68,8 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let client = Client::new();
+
+    println!("Conectando a master: {}", cli.master);
 
     match cli.command {
         Commands::Submit {
@@ -146,6 +155,7 @@ async fn submit_job(
         println!("  cargo run --bin client -- status {}", job_info.id);
     } else {
         eprintln!("Error: {}", res.status());
+        eprintln!("Body: {}", res.text().await?);
     }
 
     Ok(())

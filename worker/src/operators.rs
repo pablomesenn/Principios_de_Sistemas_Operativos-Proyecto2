@@ -1,4 +1,5 @@
 // worker/src/operators.rs
+// Operadores de procesamiento de datos con pruebas unitarias
 
 use crate::cache::SharedCache;
 use common::{Partition, Record, Task};
@@ -298,12 +299,10 @@ fn op_join(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> 
 
 // ============ Funciones auxiliares ============
 
-/// Cargar particiones de input, intentando primero del cache
 fn load_input_partitions(task: &Task, cache: &SharedCache) -> Result<Partition, String> {
     let mut all_records = Vec::new();
     
     for path in &task.input_partitions {
-        // Intentar extraer cache key del path
         if let Some(cache_key) = path_to_cache_key(path, &task.job_id.to_string()) {
             let mut cache_guard = cache.lock().unwrap();
             if let Some(cached) = cache_guard.get(&cache_key) {
@@ -312,7 +311,6 @@ fn load_input_partitions(task: &Task, cache: &SharedCache) -> Result<Partition, 
             }
         }
         
-        // Fallback: leer de disco
         let partition = read_partition(path)?;
         all_records.extend(partition.records);
     }
@@ -350,7 +348,6 @@ fn load_join_partitions(task: &Task, cache: &SharedCache) -> Result<Partition, S
     let mut all_records = Vec::new();
     
     for path in &task.join_partitions {
-        // Intentar cache primero
         if let Some(cache_key) = path_to_cache_key(path, &task.job_id.to_string()) {
             let mut cache_guard = cache.lock().unwrap();
             if let Some(cached) = cache_guard.get(&cache_key) {
@@ -366,14 +363,11 @@ fn load_join_partitions(task: &Task, cache: &SharedCache) -> Result<Partition, S
     Ok(Partition { records: all_records })
 }
 
-/// Convertir path de archivo a cache key
 fn path_to_cache_key(path: &str, job_id: &str) -> Option<String> {
-    // Path format: /tmp/minispark/{job_id}_{node_id}_p{partition}.json
     let filename = path.rsplit('/').next()?;
     let prefix = format!("{}_", job_id);
     let rest = filename.strip_prefix(&prefix)?;
     
-    // Buscar "_p" seguido de dígito
     let mut last_p_pos = None;
     let chars: Vec<char> = rest.chars().collect();
     
@@ -385,15 +379,13 @@ fn path_to_cache_key(path: &str, job_id: &str) -> Option<String> {
     
     let p_pos = last_p_pos?;
     let node_id = &rest[..p_pos];
-    
-    // Extraer partition_id
     let partition_str = &rest[p_pos + 2..];
     let partition_id: u32 = partition_str.strip_suffix(".json")?.parse().ok()?;
     
     Some(format!("{}:{}:{}", job_id, node_id, partition_id))
 }
 
-fn hash_key(key: &str, num_partitions: u32) -> u32 {
+pub fn hash_key(key: &str, num_partitions: u32) -> u32 {
     let mut hash: u32 = 0;
     for byte in key.bytes() {
         hash = hash.wrapping_mul(31).wrapping_add(byte as u32);
@@ -401,7 +393,7 @@ fn hash_key(key: &str, num_partitions: u32) -> u32 {
     hash % num_partitions
 }
 
-fn apply_map_fn(fn_name: &str, record: Record) -> Record {
+pub fn apply_map_fn(fn_name: &str, record: Record) -> Record {
     match fn_name {
         "to_lower" => Record {
             key: record.key,
@@ -426,15 +418,16 @@ fn apply_map_fn(fn_name: &str, record: Record) -> Record {
     }
 }
 
-fn apply_filter_fn(fn_name: &str, record: &Record) -> bool {
+pub fn apply_filter_fn(fn_name: &str, record: &Record) -> bool {
     match fn_name {
         "not_empty" => !record.value.trim().is_empty(),
         "is_long" => record.value.len() > 5,
+        "has_key" => record.key.is_some(),
         _ => true,
     }
 }
 
-fn apply_flat_map_fn(fn_name: &str, record: Record) -> Vec<Record> {
+pub fn apply_flat_map_fn(fn_name: &str, record: Record) -> Vec<Record> {
     match fn_name {
         "split_words" => {
             record.value
@@ -454,11 +447,20 @@ fn apply_flat_map_fn(fn_name: &str, record: Record) -> Vec<Record> {
                 })
                 .collect()
         }
+        "split_lines" => {
+            record.value
+                .lines()
+                .map(|line| Record {
+                    key: None,
+                    value: line.to_string(),
+                })
+                .collect()
+        }
         _ => vec![record],
     }
 }
 
-fn apply_reduce_fn(fn_name: &str, values: &[String]) -> String {
+pub fn apply_reduce_fn(fn_name: &str, values: &[String]) -> String {
     match fn_name {
         "sum" => {
             let sum: i64 = values.iter()
@@ -482,6 +484,317 @@ fn apply_reduce_fn(fn_name: &str, values: &[String]) -> String {
                 .map(|v| v.to_string())
                 .unwrap_or_default()
         }
+        "avg" => {
+            let nums: Vec<i64> = values.iter()
+                .filter_map(|v| v.parse::<i64>().ok())
+                .collect();
+            if nums.is_empty() {
+                "0".to_string()
+            } else {
+                (nums.iter().sum::<i64>() / nums.len() as i64).to_string()
+            }
+        }
         _ => values.first().cloned().unwrap_or_default(),
+    }
+}
+
+// ============ PRUEBAS UNITARIAS ============
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::Record;
+
+    // ============ Tests de Map ============
+
+    #[test]
+    fn test_map_to_lower() {
+        let record = Record { key: None, value: "HELLO WORLD".to_string() };
+        let result = apply_map_fn("to_lower", record);
+        assert_eq!(result.value, "hello world");
+    }
+
+    #[test]
+    fn test_map_to_upper() {
+        let record = Record { key: None, value: "hello world".to_string() };
+        let result = apply_map_fn("to_upper", record);
+        assert_eq!(result.value, "HELLO WORLD");
+    }
+
+    #[test]
+    fn test_map_pair_with_one() {
+        let record = Record { key: None, value: "word".to_string() };
+        let result = apply_map_fn("pair_with_one", record);
+        assert_eq!(result.key, Some("word".to_string()));
+        assert_eq!(result.value, "1");
+    }
+
+    #[test]
+    fn test_map_extract_key() {
+        let record = Record { key: None, value: "product_1,laptop".to_string() };
+        let result = apply_map_fn("extract_key", record);
+        assert_eq!(result.key, Some("product_1".to_string()));
+        assert_eq!(result.value, "laptop");
+    }
+
+    #[test]
+    fn test_map_identity() {
+        let record = Record { key: Some("k".to_string()), value: "v".to_string() };
+        let result = apply_map_fn("identity", record.clone());
+        assert_eq!(result.key, record.key);
+        assert_eq!(result.value, record.value);
+    }
+
+    // ============ Tests de Filter ============
+
+    #[test]
+    fn test_filter_not_empty_true() {
+        let record = Record { key: None, value: "hello".to_string() };
+        assert!(apply_filter_fn("not_empty", &record));
+    }
+
+    #[test]
+    fn test_filter_not_empty_false() {
+        let record = Record { key: None, value: "   ".to_string() };
+        assert!(!apply_filter_fn("not_empty", &record));
+    }
+
+    #[test]
+    fn test_filter_is_long_true() {
+        let record = Record { key: None, value: "hello world".to_string() };
+        assert!(apply_filter_fn("is_long", &record));
+    }
+
+    #[test]
+    fn test_filter_is_long_false() {
+        let record = Record { key: None, value: "hi".to_string() };
+        assert!(!apply_filter_fn("is_long", &record));
+    }
+
+    #[test]
+    fn test_filter_has_key_true() {
+        let record = Record { key: Some("k".to_string()), value: "v".to_string() };
+        assert!(apply_filter_fn("has_key", &record));
+    }
+
+    #[test]
+    fn test_filter_has_key_false() {
+        let record = Record { key: None, value: "v".to_string() };
+        assert!(!apply_filter_fn("has_key", &record));
+    }
+
+    // ============ Tests de FlatMap ============
+
+    #[test]
+    fn test_flatmap_split_words() {
+        let record = Record { key: None, value: "hello world foo".to_string() };
+        let results = apply_flat_map_fn("split_words", record);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].value, "hello");
+        assert_eq!(results[1].value, "world");
+        assert_eq!(results[2].value, "foo");
+    }
+
+    #[test]
+    fn test_flatmap_split_chars() {
+        let record = Record { key: None, value: "abc".to_string() };
+        let results = apply_flat_map_fn("split_chars", record);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].value, "a");
+        assert_eq!(results[1].value, "b");
+        assert_eq!(results[2].value, "c");
+    }
+
+    #[test]
+    fn test_flatmap_split_lines() {
+        let record = Record { key: None, value: "line1\nline2\nline3".to_string() };
+        let results = apply_flat_map_fn("split_lines", record);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].value, "line1");
+        assert_eq!(results[1].value, "line2");
+        assert_eq!(results[2].value, "line3");
+    }
+
+    #[test]
+    fn test_flatmap_empty_input() {
+        let record = Record { key: None, value: "".to_string() };
+        let results = apply_flat_map_fn("split_words", record);
+        assert_eq!(results.len(), 0);
+    }
+
+    // ============ Tests de Reduce ============
+
+    #[test]
+    fn test_reduce_sum() {
+        let values = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        assert_eq!(apply_reduce_fn("sum", &values), "6");
+    }
+
+    #[test]
+    fn test_reduce_sum_with_invalid() {
+        let values = vec!["1".to_string(), "invalid".to_string(), "3".to_string()];
+        assert_eq!(apply_reduce_fn("sum", &values), "4");
+    }
+
+    #[test]
+    fn test_reduce_count() {
+        let values = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(apply_reduce_fn("count", &values), "3");
+    }
+
+    #[test]
+    fn test_reduce_concat() {
+        let values = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(apply_reduce_fn("concat", &values), "a,b,c");
+    }
+
+    #[test]
+    fn test_reduce_min() {
+        let values = vec!["5".to_string(), "1".to_string(), "9".to_string()];
+        assert_eq!(apply_reduce_fn("min", &values), "1");
+    }
+
+    #[test]
+    fn test_reduce_max() {
+        let values = vec!["5".to_string(), "1".to_string(), "9".to_string()];
+        assert_eq!(apply_reduce_fn("max", &values), "9");
+    }
+
+    #[test]
+    fn test_reduce_avg() {
+        let values = vec!["10".to_string(), "20".to_string(), "30".to_string()];
+        assert_eq!(apply_reduce_fn("avg", &values), "20");
+    }
+
+    #[test]
+    fn test_reduce_empty() {
+        let values: Vec<String> = vec![];
+        assert_eq!(apply_reduce_fn("sum", &values), "0");
+        assert_eq!(apply_reduce_fn("count", &values), "0");
+    }
+
+    // ============ Tests de Hash ============
+
+    #[test]
+    fn test_hash_key_deterministic() {
+        let key = "test_key";
+        let hash1 = hash_key(key, 4);
+        let hash2 = hash_key(key, 4);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_hash_key_distribution() {
+        let keys = vec!["a", "b", "c", "d", "e", "f", "g", "h"];
+        let mut partitions = vec![0u32; 4];
+        
+        for key in keys {
+            let partition = hash_key(key, 4);
+            assert!(partition < 4);
+            partitions[partition as usize] += 1;
+        }
+        
+        // Verificar que hay al menos algo de distribución
+        assert!(partitions.iter().filter(|&&c| c > 0).count() >= 2);
+    }
+
+    #[test]
+    fn test_hash_key_empty() {
+        let partition = hash_key("", 4);
+        assert!(partition < 4);
+    }
+
+    // ============ Tests de Partition I/O ============
+
+    #[test]
+    fn test_write_read_partition() {
+        ensure_data_dir();
+        
+        let partition = Partition {
+            records: vec![
+                Record { key: Some("k1".to_string()), value: "v1".to_string() },
+                Record { key: Some("k2".to_string()), value: "v2".to_string() },
+            ],
+        };
+        
+        let path = "/tmp/minispark/test_partition.json";
+        write_partition(path, &partition).unwrap();
+        
+        let read_back = read_partition(path).unwrap();
+        assert_eq!(read_back.records.len(), 2);
+        assert_eq!(read_back.records[0].key, Some("k1".to_string()));
+        assert_eq!(read_back.records[0].value, "v1");
+        
+        // Limpiar
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_read_nonexistent_partition() {
+        let result = read_partition("/tmp/minispark/nonexistent.json");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().records.len(), 0);
+    }
+
+    // ============ Tests de Path Utilities ============
+
+    #[test]
+    fn test_output_path() {
+        let path = output_path("job123", "map", 2);
+        assert_eq!(path, "/tmp/minispark/job123_map_p2.json");
+    }
+
+    #[test]
+    fn test_shuffle_output_path() {
+        let path = shuffle_output_path("job123", "reduce", 1, 3);
+        assert_eq!(path, "/tmp/minispark/job123_reduce_shuffle_p1_to_p3.json");
+    }
+
+    #[test]
+    fn test_path_to_cache_key() {
+        let path = "/tmp/minispark/job123_map_p2.json";
+        let key = path_to_cache_key(path, "job123");
+        assert_eq!(key, Some("job123:map:2".to_string()));
+    }
+
+    #[test]
+    fn test_path_to_cache_key_complex_node() {
+        let path = "/tmp/minispark/job123_reduce_by_key_p0.json";
+        let key = path_to_cache_key(path, "job123");
+        assert_eq!(key, Some("job123:reduce_by_key:0".to_string()));
+    }
+
+    // ============ Tests de integración simple ============
+
+    #[test]
+    fn test_wordcount_pipeline() {
+        // Simular pipeline: split_words -> pair_with_one -> reduce sum
+        let input = Record { key: None, value: "hello world hello".to_string() };
+        
+        // Step 1: flat_map split_words
+        let words = apply_flat_map_fn("split_words", input);
+        assert_eq!(words.len(), 3);
+        
+        // Step 2: map pair_with_one
+        let pairs: Vec<Record> = words.into_iter()
+            .map(|r| apply_map_fn("pair_with_one", r))
+            .collect();
+        
+        assert_eq!(pairs.len(), 3);
+        assert!(pairs.iter().all(|r| r.value == "1"));
+        
+        // Step 3: group by key y reduce sum
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        for record in pairs {
+            let key = record.key.unwrap_or_default();
+            groups.entry(key).or_default().push(record.value);
+        }
+        
+        let results: HashMap<String, String> = groups.into_iter()
+            .map(|(k, v)| (k, apply_reduce_fn("sum", &v)))
+            .collect();
+        
+        assert_eq!(results.get("hello"), Some(&"2".to_string()));
+        assert_eq!(results.get("world"), Some(&"1".to_string()));
     }
 }
