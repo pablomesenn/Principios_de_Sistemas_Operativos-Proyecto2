@@ -1,4 +1,3 @@
-// worker/src/operators.rs
 // Operadores de procesamiento de datos con pruebas unitarias
 
 use crate::cache::SharedCache;
@@ -20,29 +19,29 @@ pub fn output_path(job_id: &str, node_id: &str, partition_id: u32) -> String {
 }
 
 pub fn shuffle_output_path(job_id: &str, node_id: &str, from_part: u32, to_part: u32) -> String {
-    format!("{}/{}_{}_shuffle_p{}_to_p{}.json", DATA_DIR, job_id, node_id, from_part, to_part)
+    format!(
+        "{}/{}_{}_shuffle_p{}_to_p{}.json",
+        DATA_DIR, job_id, node_id, from_part, to_part
+    )
 }
 
 pub fn read_partition(path: &str) -> Result<Partition, String> {
     if !Path::new(path).exists() {
         return Ok(Partition::default());
     }
-    
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("Error leyendo {}: {}", path, e))?;
-    
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Error parseando {}: {}", path, e))
+
+    let content = fs::read_to_string(path).map_err(|e| format!("Error leyendo {}: {}", path, e))?;
+
+    serde_json::from_str(&content).map_err(|e| format!("Error parseando {}: {}", path, e))
 }
 
 pub fn write_partition(path: &str, partition: &Partition) -> Result<(), String> {
     ensure_data_dir();
-    
-    let content = serde_json::to_string(partition)
-        .map_err(|e| format!("Error serializando: {}", e))?;
-    
-    fs::write(path, content)
-        .map_err(|e| format!("Error escribiendo {}: {}", path, e))
+
+    let content =
+        serde_json::to_string(partition).map_err(|e| format!("Error serializando: {}", e))?;
+
+    fs::write(path, content).map_err(|e| format!("Error escribiendo {}: {}", path, e))
 }
 
 /// Resultado de ejecución incluyendo shuffle outputs
@@ -68,32 +67,33 @@ pub fn execute_operator(task: &Task, cache: &SharedCache) -> Result<ExecutionRes
 }
 
 fn op_read_csv(task: &Task) -> Result<ExecutionResult, String> {
-    let path = task.input_path.as_ref()
+    let path = task
+        .input_path
+        .as_ref()
         .ok_or("read_csv requiere input_path")?;
-    
-    let file = File::open(path)
-        .map_err(|e| format!("No se pudo abrir {}: {}", path, e))?;
-    
+
+    let file = File::open(path).map_err(|e| format!("No se pudo abrir {}: {}", path, e))?;
+
     let reader = BufReader::new(file);
     let mut records = Vec::new();
     let mut line_num = 0;
-    
+
     for line in reader.lines() {
         let line = line.map_err(|e| format!("Error leyendo línea: {}", e))?;
-        
+
         if line_num == 0 {
             line_num += 1;
             continue;
         }
-        
+
         if (line_num - 1) % task.total_partitions == task.partition_id {
             let value = line.split(',').next().unwrap_or(&line).to_string();
             records.push(Record { key: None, value });
         }
-        
+
         line_num += 1;
     }
-    
+
     let count = records.len() as u64;
     Ok(ExecutionResult {
         partition: Partition { records },
@@ -103,32 +103,34 @@ fn op_read_csv(task: &Task) -> Result<ExecutionResult, String> {
 }
 
 fn op_read_jsonl(task: &Task) -> Result<ExecutionResult, String> {
-    let path = task.input_path.as_ref()
+    let path = task
+        .input_path
+        .as_ref()
         .ok_or("read_jsonl requiere input_path")?;
-    
-    let file = File::open(path)
-        .map_err(|e| format!("No se pudo abrir {}: {}", path, e))?;
-    
+
+    let file = File::open(path).map_err(|e| format!("No se pudo abrir {}: {}", path, e))?;
+
     let reader = BufReader::new(file);
     let mut records = Vec::new();
     let mut line_num = 0;
-    
+
     for line in reader.lines() {
         let line = line.map_err(|e| format!("Error leyendo línea: {}", e))?;
-        
+
         if line_num % task.total_partitions == task.partition_id {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                 let value = json.to_string();
-                let key = json.get("key")
+                let key = json
+                    .get("key")
                     .and_then(|k| k.as_str())
                     .map(|s| s.to_string());
                 records.push(Record { key, value });
             }
         }
-        
+
         line_num += 1;
     }
-    
+
     let count = records.len() as u64;
     Ok(ExecutionResult {
         partition: Partition { records },
@@ -140,11 +142,13 @@ fn op_read_jsonl(task: &Task) -> Result<ExecutionResult, String> {
 fn op_map(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
     let input = load_input_partitions(task, cache)?;
     let fn_name = task.fn_name.as_deref().unwrap_or("identity");
-    
-    let records: Vec<Record> = input.records.into_iter()
+
+    let records: Vec<Record> = input
+        .records
+        .into_iter()
         .map(|r| apply_map_fn(fn_name, r))
         .collect();
-    
+
     let count = records.len() as u64;
     Ok(ExecutionResult {
         partition: Partition { records },
@@ -156,11 +160,13 @@ fn op_map(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
 fn op_filter(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
     let input = load_input_partitions(task, cache)?;
     let fn_name = task.fn_name.as_deref().unwrap_or("not_empty");
-    
-    let records: Vec<Record> = input.records.into_iter()
+
+    let records: Vec<Record> = input
+        .records
+        .into_iter()
         .filter(|r| apply_filter_fn(fn_name, r))
         .collect();
-    
+
     let count = records.len() as u64;
     Ok(ExecutionResult {
         partition: Partition { records },
@@ -172,11 +178,13 @@ fn op_filter(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String
 fn op_flat_map(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
     let input = load_input_partitions(task, cache)?;
     let fn_name = task.fn_name.as_deref().unwrap_or("split_words");
-    
-    let records: Vec<Record> = input.records.into_iter()
+
+    let records: Vec<Record> = input
+        .records
+        .into_iter()
         .flat_map(|r| apply_flat_map_fn(fn_name, r))
         .collect();
-    
+
     let count = records.len() as u64;
     Ok(ExecutionResult {
         partition: Partition { records },
@@ -191,22 +199,26 @@ fn op_reduce_by_key(task: &Task, cache: &SharedCache) -> Result<ExecutionResult,
     } else {
         load_input_partitions(task, cache)?
     };
-    
+
     let fn_name = task.fn_name.as_deref().unwrap_or("sum");
-    
+
     let mut groups: HashMap<String, Vec<String>> = HashMap::new();
     for record in input.records {
         let key = record.key.unwrap_or_default();
         groups.entry(key).or_default().push(record.value);
     }
-    
-    let records: Vec<Record> = groups.into_iter()
+
+    let records: Vec<Record> = groups
+        .into_iter()
         .map(|(key, values)| {
             let reduced = apply_reduce_fn(fn_name, &values);
-            Record { key: Some(key), value: reduced }
+            Record {
+                key: Some(key),
+                value: reduced,
+            }
         })
         .collect();
-    
+
     let count = records.len() as u64;
     Ok(ExecutionResult {
         partition: Partition { records },
@@ -218,21 +230,21 @@ fn op_reduce_by_key(task: &Task, cache: &SharedCache) -> Result<ExecutionResult,
 fn op_shuffle_write(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
     let input = load_input_partitions(task, cache)?;
     let total_partitions = task.total_partitions;
-    
+
     let mut buckets: HashMap<u32, Vec<Record>> = HashMap::new();
     for i in 0..total_partitions {
         buckets.insert(i, Vec::new());
     }
-    
+
     for record in input.records {
         let key = record.key.as_deref().unwrap_or("");
         let target_partition = hash_key(key, total_partitions);
         buckets.get_mut(&target_partition).unwrap().push(record);
     }
-    
+
     let mut shuffle_outputs = Vec::new();
     let mut total_records = 0u64;
-    
+
     for (target_part, records) in buckets {
         let path = shuffle_output_path(
             &task.job_id.to_string(),
@@ -240,13 +252,13 @@ fn op_shuffle_write(task: &Task, cache: &SharedCache) -> Result<ExecutionResult,
             task.partition_id,
             target_part,
         );
-        
+
         total_records += records.len() as u64;
         let partition = Partition { records };
         write_partition(&path, &partition)?;
         shuffle_outputs.push(path);
     }
-    
+
     Ok(ExecutionResult {
         partition: Partition::default(),
         records_processed: total_records,
@@ -257,7 +269,7 @@ fn op_shuffle_write(task: &Task, cache: &SharedCache) -> Result<ExecutionResult,
 fn op_shuffle_read(task: &Task) -> Result<ExecutionResult, String> {
     let partition = load_shuffle_inputs(task)?;
     let count = partition.records.len() as u64;
-    
+
     Ok(ExecutionResult {
         partition,
         records_processed: count,
@@ -268,17 +280,17 @@ fn op_shuffle_read(task: &Task) -> Result<ExecutionResult, String> {
 fn op_join(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> {
     let left = load_input_partitions(task, cache)?;
     let right = load_join_partitions(task, cache)?;
-    
+
     let mut right_index: HashMap<String, Vec<String>> = HashMap::new();
     for record in right.records {
         let key = record.key.unwrap_or_default();
         right_index.entry(key).or_default().push(record.value);
     }
-    
+
     let mut records = Vec::new();
     for left_record in left.records {
         let key = left_record.key.clone().unwrap_or_default();
-        
+
         if let Some(right_values) = right_index.get(&key) {
             for right_value in right_values {
                 records.push(Record {
@@ -288,7 +300,7 @@ fn op_join(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> 
             }
         }
     }
-    
+
     let count = records.len() as u64;
     Ok(ExecutionResult {
         partition: Partition { records },
@@ -301,7 +313,7 @@ fn op_join(task: &Task, cache: &SharedCache) -> Result<ExecutionResult, String> 
 
 fn load_input_partitions(task: &Task, cache: &SharedCache) -> Result<Partition, String> {
     let mut all_records = Vec::new();
-    
+
     for path in &task.input_partitions {
         if let Some(cache_key) = path_to_cache_key(path, &task.job_id.to_string()) {
             let mut cache_guard = cache.lock().unwrap();
@@ -310,43 +322,45 @@ fn load_input_partitions(task: &Task, cache: &SharedCache) -> Result<Partition, 
                 continue;
             }
         }
-        
+
         let partition = read_partition(path)?;
         all_records.extend(partition.records);
     }
-    
-    Ok(Partition { records: all_records })
+
+    Ok(Partition {
+        records: all_records,
+    })
 }
 
 fn load_shuffle_inputs(task: &Task) -> Result<Partition, String> {
     let mut all_records = Vec::new();
-    
+
     let pattern = "_shuffle_p";
     let target = format!("_to_p{}.json", task.partition_id);
-    
+
     if let Ok(entries) = fs::read_dir(DATA_DIR) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let filename = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            
-            if filename.contains(&task.job_id.to_string()) 
+            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            if filename.contains(&task.job_id.to_string())
                 && filename.contains(pattern)
-                && filename.ends_with(&target) 
+                && filename.ends_with(&target)
             {
                 let partition = read_partition(path.to_str().unwrap())?;
                 all_records.extend(partition.records);
             }
         }
     }
-    
-    Ok(Partition { records: all_records })
+
+    Ok(Partition {
+        records: all_records,
+    })
 }
 
 fn load_join_partitions(task: &Task, cache: &SharedCache) -> Result<Partition, String> {
     let mut all_records = Vec::new();
-    
+
     for path in &task.join_partitions {
         if let Some(cache_key) = path_to_cache_key(path, &task.job_id.to_string()) {
             let mut cache_guard = cache.lock().unwrap();
@@ -355,33 +369,41 @@ fn load_join_partitions(task: &Task, cache: &SharedCache) -> Result<Partition, S
                 continue;
             }
         }
-        
+
         let partition = read_partition(path)?;
         all_records.extend(partition.records);
     }
-    
-    Ok(Partition { records: all_records })
+
+    Ok(Partition {
+        records: all_records,
+    })
 }
 
 fn path_to_cache_key(path: &str, job_id: &str) -> Option<String> {
     let filename = path.rsplit('/').next()?;
     let prefix = format!("{}_", job_id);
     let rest = filename.strip_prefix(&prefix)?;
-    
+
     let mut last_p_pos = None;
     let chars: Vec<char> = rest.chars().collect();
-    
+
     for i in 0..chars.len().saturating_sub(2) {
-        if chars[i] == '_' && chars[i + 1] == 'p' && chars.get(i + 2).map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        if chars[i] == '_'
+            && chars[i + 1] == 'p'
+            && chars
+                .get(i + 2)
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+        {
             last_p_pos = Some(i);
         }
     }
-    
+
     let p_pos = last_p_pos?;
     let node_id = &rest[..p_pos];
     let partition_str = &rest[p_pos + 2..];
     let partition_id: u32 = partition_str.strip_suffix(".json")?.parse().ok()?;
-    
+
     Some(format!("{}:{}:{}", job_id, node_id, partition_id))
 }
 
@@ -413,7 +435,7 @@ pub fn apply_map_fn(fn_name: &str, record: Record) -> Record {
                 key: Some(parts[0].to_string()),
                 value: parts.get(1).unwrap_or(&"").to_string(),
             }
-        },
+        }
         "identity" | _ => record,
     }
 }
@@ -429,33 +451,30 @@ pub fn apply_filter_fn(fn_name: &str, record: &Record) -> bool {
 
 pub fn apply_flat_map_fn(fn_name: &str, record: Record) -> Vec<Record> {
     match fn_name {
-        "split_words" => {
-            record.value
-                .split_whitespace()
-                .map(|word| Record {
-                    key: None,
-                    value: word.to_string(),
-                })
-                .collect()
-        }
-        "split_chars" => {
-            record.value
-                .chars()
-                .map(|c| Record {
-                    key: None,
-                    value: c.to_string(),
-                })
-                .collect()
-        }
-        "split_lines" => {
-            record.value
-                .lines()
-                .map(|line| Record {
-                    key: None,
-                    value: line.to_string(),
-                })
-                .collect()
-        }
+        "split_words" => record
+            .value
+            .split_whitespace()
+            .map(|word| Record {
+                key: None,
+                value: word.to_string(),
+            })
+            .collect(),
+        "split_chars" => record
+            .value
+            .chars()
+            .map(|c| Record {
+                key: None,
+                value: c.to_string(),
+            })
+            .collect(),
+        "split_lines" => record
+            .value
+            .lines()
+            .map(|line| Record {
+                key: None,
+                value: line.to_string(),
+            })
+            .collect(),
         _ => vec![record],
     }
 }
@@ -463,29 +482,26 @@ pub fn apply_flat_map_fn(fn_name: &str, record: Record) -> Vec<Record> {
 pub fn apply_reduce_fn(fn_name: &str, values: &[String]) -> String {
     match fn_name {
         "sum" => {
-            let sum: i64 = values.iter()
-                .filter_map(|v| v.parse::<i64>().ok())
-                .sum();
+            let sum: i64 = values.iter().filter_map(|v| v.parse::<i64>().ok()).sum();
             sum.to_string()
         }
         "count" => values.len().to_string(),
         "concat" => values.join(","),
-        "min" => {
-            values.iter()
-                .filter_map(|v| v.parse::<i64>().ok())
-                .min()
-                .map(|v| v.to_string())
-                .unwrap_or_default()
-        }
-        "max" => {
-            values.iter()
-                .filter_map(|v| v.parse::<i64>().ok())
-                .max()
-                .map(|v| v.to_string())
-                .unwrap_or_default()
-        }
+        "min" => values
+            .iter()
+            .filter_map(|v| v.parse::<i64>().ok())
+            .min()
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "max" => values
+            .iter()
+            .filter_map(|v| v.parse::<i64>().ok())
+            .max()
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
         "avg" => {
-            let nums: Vec<i64> = values.iter()
+            let nums: Vec<i64> = values
+                .iter()
                 .filter_map(|v| v.parse::<i64>().ok())
                 .collect();
             if nums.is_empty() {
@@ -509,21 +525,30 @@ mod tests {
 
     #[test]
     fn test_map_to_lower() {
-        let record = Record { key: None, value: "HELLO WORLD".to_string() };
+        let record = Record {
+            key: None,
+            value: "HELLO WORLD".to_string(),
+        };
         let result = apply_map_fn("to_lower", record);
         assert_eq!(result.value, "hello world");
     }
 
     #[test]
     fn test_map_to_upper() {
-        let record = Record { key: None, value: "hello world".to_string() };
+        let record = Record {
+            key: None,
+            value: "hello world".to_string(),
+        };
         let result = apply_map_fn("to_upper", record);
         assert_eq!(result.value, "HELLO WORLD");
     }
 
     #[test]
     fn test_map_pair_with_one() {
-        let record = Record { key: None, value: "word".to_string() };
+        let record = Record {
+            key: None,
+            value: "word".to_string(),
+        };
         let result = apply_map_fn("pair_with_one", record);
         assert_eq!(result.key, Some("word".to_string()));
         assert_eq!(result.value, "1");
@@ -531,7 +556,10 @@ mod tests {
 
     #[test]
     fn test_map_extract_key() {
-        let record = Record { key: None, value: "product_1,laptop".to_string() };
+        let record = Record {
+            key: None,
+            value: "product_1,laptop".to_string(),
+        };
         let result = apply_map_fn("extract_key", record);
         assert_eq!(result.key, Some("product_1".to_string()));
         assert_eq!(result.value, "laptop");
@@ -539,7 +567,10 @@ mod tests {
 
     #[test]
     fn test_map_identity() {
-        let record = Record { key: Some("k".to_string()), value: "v".to_string() };
+        let record = Record {
+            key: Some("k".to_string()),
+            value: "v".to_string(),
+        };
         let result = apply_map_fn("identity", record.clone());
         assert_eq!(result.key, record.key);
         assert_eq!(result.value, record.value);
@@ -549,37 +580,55 @@ mod tests {
 
     #[test]
     fn test_filter_not_empty_true() {
-        let record = Record { key: None, value: "hello".to_string() };
+        let record = Record {
+            key: None,
+            value: "hello".to_string(),
+        };
         assert!(apply_filter_fn("not_empty", &record));
     }
 
     #[test]
     fn test_filter_not_empty_false() {
-        let record = Record { key: None, value: "   ".to_string() };
+        let record = Record {
+            key: None,
+            value: "   ".to_string(),
+        };
         assert!(!apply_filter_fn("not_empty", &record));
     }
 
     #[test]
     fn test_filter_is_long_true() {
-        let record = Record { key: None, value: "hello world".to_string() };
+        let record = Record {
+            key: None,
+            value: "hello world".to_string(),
+        };
         assert!(apply_filter_fn("is_long", &record));
     }
 
     #[test]
     fn test_filter_is_long_false() {
-        let record = Record { key: None, value: "hi".to_string() };
+        let record = Record {
+            key: None,
+            value: "hi".to_string(),
+        };
         assert!(!apply_filter_fn("is_long", &record));
     }
 
     #[test]
     fn test_filter_has_key_true() {
-        let record = Record { key: Some("k".to_string()), value: "v".to_string() };
+        let record = Record {
+            key: Some("k".to_string()),
+            value: "v".to_string(),
+        };
         assert!(apply_filter_fn("has_key", &record));
     }
 
     #[test]
     fn test_filter_has_key_false() {
-        let record = Record { key: None, value: "v".to_string() };
+        let record = Record {
+            key: None,
+            value: "v".to_string(),
+        };
         assert!(!apply_filter_fn("has_key", &record));
     }
 
@@ -587,7 +636,10 @@ mod tests {
 
     #[test]
     fn test_flatmap_split_words() {
-        let record = Record { key: None, value: "hello world foo".to_string() };
+        let record = Record {
+            key: None,
+            value: "hello world foo".to_string(),
+        };
         let results = apply_flat_map_fn("split_words", record);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].value, "hello");
@@ -597,7 +649,10 @@ mod tests {
 
     #[test]
     fn test_flatmap_split_chars() {
-        let record = Record { key: None, value: "abc".to_string() };
+        let record = Record {
+            key: None,
+            value: "abc".to_string(),
+        };
         let results = apply_flat_map_fn("split_chars", record);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].value, "a");
@@ -607,7 +662,10 @@ mod tests {
 
     #[test]
     fn test_flatmap_split_lines() {
-        let record = Record { key: None, value: "line1\nline2\nline3".to_string() };
+        let record = Record {
+            key: None,
+            value: "line1\nline2\nline3".to_string(),
+        };
         let results = apply_flat_map_fn("split_lines", record);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].value, "line1");
@@ -617,7 +675,10 @@ mod tests {
 
     #[test]
     fn test_flatmap_empty_input() {
-        let record = Record { key: None, value: "".to_string() };
+        let record = Record {
+            key: None,
+            value: "".to_string(),
+        };
         let results = apply_flat_map_fn("split_words", record);
         assert_eq!(results.len(), 0);
     }
@@ -687,13 +748,13 @@ mod tests {
     fn test_hash_key_distribution() {
         let keys = vec!["a", "b", "c", "d", "e", "f", "g", "h"];
         let mut partitions = vec![0u32; 4];
-        
+
         for key in keys {
             let partition = hash_key(key, 4);
             assert!(partition < 4);
             partitions[partition as usize] += 1;
         }
-        
+
         // Verificar que hay al menos algo de distribución
         assert!(partitions.iter().filter(|&&c| c > 0).count() >= 2);
     }
@@ -709,22 +770,28 @@ mod tests {
     #[test]
     fn test_write_read_partition() {
         ensure_data_dir();
-        
+
         let partition = Partition {
             records: vec![
-                Record { key: Some("k1".to_string()), value: "v1".to_string() },
-                Record { key: Some("k2".to_string()), value: "v2".to_string() },
+                Record {
+                    key: Some("k1".to_string()),
+                    value: "v1".to_string(),
+                },
+                Record {
+                    key: Some("k2".to_string()),
+                    value: "v2".to_string(),
+                },
             ],
         };
-        
+
         let path = "/tmp/minispark/test_partition.json";
         write_partition(path, &partition).unwrap();
-        
+
         let read_back = read_partition(path).unwrap();
         assert_eq!(read_back.records.len(), 2);
         assert_eq!(read_back.records[0].key, Some("k1".to_string()));
         assert_eq!(read_back.records[0].value, "v1");
-        
+
         // Limpiar
         fs::remove_file(path).ok();
     }
@@ -769,31 +836,36 @@ mod tests {
     #[test]
     fn test_wordcount_pipeline() {
         // Simular pipeline: split_words -> pair_with_one -> reduce sum
-        let input = Record { key: None, value: "hello world hello".to_string() };
-        
+        let input = Record {
+            key: None,
+            value: "hello world hello".to_string(),
+        };
+
         // Step 1: flat_map split_words
         let words = apply_flat_map_fn("split_words", input);
         assert_eq!(words.len(), 3);
-        
+
         // Step 2: map pair_with_one
-        let pairs: Vec<Record> = words.into_iter()
+        let pairs: Vec<Record> = words
+            .into_iter()
             .map(|r| apply_map_fn("pair_with_one", r))
             .collect();
-        
+
         assert_eq!(pairs.len(), 3);
         assert!(pairs.iter().all(|r| r.value == "1"));
-        
+
         // Step 3: group by key y reduce sum
         let mut groups: HashMap<String, Vec<String>> = HashMap::new();
         for record in pairs {
             let key = record.key.unwrap_or_default();
             groups.entry(key).or_default().push(record.value);
         }
-        
-        let results: HashMap<String, String> = groups.into_iter()
+
+        let results: HashMap<String, String> = groups
+            .into_iter()
             .map(|(k, v)| (k, apply_reduce_fn("sum", &v)))
             .collect();
-        
+
         assert_eq!(results.get("hello"), Some(&"2".to_string()));
         assert_eq!(results.get("world"), Some(&"1".to_string()));
     }

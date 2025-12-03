@@ -1,5 +1,3 @@
-// worker/src/main.rs
-
 mod cache;
 mod metrics;
 mod operators;
@@ -13,40 +11,48 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-// Configuración
+// Config
 const HEARTBEAT_INTERVAL_SECS: u64 = 2;
 const POLL_INTERVAL_MS: u64 = 100;
 const POLL_INTERVAL_NO_TASK_MS: u64 = 200;
 const POLL_INTERVAL_ERROR_SECS: u64 = 1;
 const METRICS_REPORT_INTERVAL_SECS: u64 = 30;
 
-// Límites por tarea
-const MAX_TASK_TIME_SECS: u64 = 5; // tiempo máximo por tarea
+// Per-task execution limits
+const MAX_TASK_TIME_SECS: u64 = 5; // max allowed time per task
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let log = Logger::new("WORKER");
 
+    // Ensure base data directories exist (/tmp/minispark etc.)
     operators::ensure_data_dir();
 
-    // Número de hilos configurables
+    // Number of async executor loops per worker (logical "threads")
     let worker_threads: usize = std::env::var("WORKER_THREADS")
         .unwrap_or_else(|_| "9".into())
         .parse()
         .unwrap_or(9);
 
+    // Shared HTTP client used to communicate with master
     let client = Client::new();
+
+    // Master URL (configurable, defaults to localhost)
     let master_url = std::env::var("MASTER_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+
+    // Worker port (base port, metrics server uses port+1000)
     let worker_port: u16 = std::env::var("WORKER_PORT")
         .unwrap_or_else(|_| "9000".into())
         .parse()
         .unwrap_or(9000);
 
+    // Optional failure simulation probability (0–100)
     let fail_probability: u32 = std::env::var("FAIL_PROBABILITY")
         .unwrap_or_else(|_| "0".into())
         .parse()
         .unwrap_or(0);
 
+    // Startup log
     log.emit(
         log.info("Mini-Spark Worker iniciando")
             .field("master", &master_url)
@@ -56,15 +62,16 @@ async fn main() -> anyhow::Result<()> {
 
     if fail_probability > 0 {
         log.emit(
-            log.warn("Modo test activado")
+            log.warn("Test mode activated")
                 .field("fail_probability", format!("{}%", fail_probability)),
         );
     }
 
-    // Inicializar cache
+    // Initialize cache
+    // Shared in-memory + spill-to-disk partition cache
     let cache = new_shared_cache();
 
-    // Registro en el master
+    // Register worker instance in master; master will assign an ID
     let reg = WorkerRegistration {
         id: Uuid::nil(),
         host: "127.0.0.1".into(),
@@ -77,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
         .send()
         .await?;
 
+    // Receive confirmed registration (with assigned worker_id)
     let reg_res: WorkerRegistration = res.json().await?;
     let worker_id = reg_res.id;
 
@@ -85,11 +93,14 @@ async fn main() -> anyhow::Result<()> {
             .field("worker_id", worker_id.to_string()),
     );
 
-    // Inicializar métricas
+    // Metrics collector for this worker instance
     let metrics = new_shared_metrics(worker_id.to_string());
+
+    // Tracks number of tasks currently executing on this process
     let active_tasks = Arc::new(AtomicU32::new(0));
 
     // Heartbeats
+    // Periodically send heartbeats to master with current active task count
     let hb_client = client.clone();
     let hb_master_url = master_url.clone();
     let hb_active = active_tasks.clone();
@@ -118,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Reporte periódico de métricas
+    // Periodically log system and task metrics to stdout
     let m2 = metrics.clone();
     let c2 = cache.clone();
     tokio::spawn(async move {
@@ -126,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(Duration::from_secs(METRICS_REPORT_INTERVAL_SECS)).await;
 
+            // Fetch cache + worker metrics snapshot
             let cache_stats = c2.lock().unwrap().stats();
             let worker_metrics = m2.lock().unwrap().get_metrics(
                 cache_stats.hits,
@@ -147,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Server para /metrics
+    // Spawn a lightweight HTTP server exposing this worker's metrics
     let m3 = metrics.clone();
     let c3 = cache.clone();
     tokio::spawn(async move {
@@ -170,13 +182,14 @@ async fn main() -> anyhow::Result<()> {
             }),
         );
 
+        // Expose metrics on worker_port + 1000 to avoid collision with main worker port
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], worker_port + 1000));
         if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
             let _ = axum::serve(listener, app).await;
         }
     });
 
-    // Lanzar pool de hilos asincrónicos ejecutores
+    // Spawn N independent executor loops that poll master for tasks
     for _ in 0..worker_threads {
         let worker_id = worker_id.clone();
         let master_url = master_url.clone();
@@ -199,13 +212,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Mantener vivo el worker
+    // Keep worker process alive (actual work happens in spawned tasks)
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
 }
 
-// Loop ejecutor por hilo
+// Main per-"thread" executor loop: poll master, run tasks, report completion
 async fn executor_loop(
     worker_id: Uuid,
     master_url: String,
@@ -218,7 +231,7 @@ async fn executor_loop(
     let log = Logger::new("EXECUTOR");
 
     loop {
-        // Poll por tarea
+        // Ask the master for a task assigned to this worker
         let resp = client
             .get(format!(
                 "{}/api/v1/workers/task?worker_id={}",
@@ -228,23 +241,28 @@ async fn executor_loop(
             .await;
 
         match resp {
+            // Received a task to execute
             Ok(res) if res.status().is_success() => {
                 let task: Task = match res.json().await {
                     Ok(t) => t,
+                    // If JSON decoding fails, back off a bit and retry
                     Err(_) => {
                         tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
                         continue;
                     }
                 };
 
+                // Track active tasks and notify metrics collector
                 active_tasks.fetch_add(1, Ordering::Relaxed);
                 metrics.lock().unwrap().task_started();
 
+                // Measure task execution time
                 let start = Instant::now();
                 let mut result =
                     execute_task_with_failure_simulation(&task, fail_probability, &cache);
                 let elapsed = start.elapsed();
 
+                // Enforce max per-task time limit
                 if elapsed > Duration::from_secs(MAX_TASK_TIME_SECS) {
                     result.success = false;
                     result.error = Some(format!(
@@ -255,12 +273,14 @@ async fn executor_loop(
                     result.records_processed = 0;
                 }
 
+                // Report completion back to master (fire-and-forget)
                 let _ = client
                     .post(format!("{}/api/v1/workers/task/complete", master_url))
                     .json(&result)
                     .send()
                     .await;
 
+                // Decrement active task count and update metrics
                 active_tasks.fetch_sub(1, Ordering::Relaxed);
                 metrics.lock().unwrap().task_completed(
                     result.success,
@@ -269,10 +289,12 @@ async fn executor_loop(
                 );
             }
 
+            // No tasks available for now
             Ok(res) if res.status() == reqwest::StatusCode::NO_CONTENT => {
                 tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_NO_TASK_MS)).await;
             }
 
+            // Any other HTTP error or network error: short backoff
             Ok(_) | Err(_) => {
                 tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_ERROR_SECS)).await;
             }
@@ -280,18 +302,21 @@ async fn executor_loop(
     }
 }
 
+// Wrap real task execution with optional failure simulation
 fn execute_task_with_failure_simulation(
     task: &Task,
     fail_probability: u32,
     cache: &SharedCache,
 ) -> TaskResult {
     if fail_probability > 0 {
+        // Very simple pseudo-random generator using current time nanoseconds
         let random: u32 = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .subsec_nanos())
             % 100;
 
+        // Simulated failure if random < fail_probability (percentage)
         if random < fail_probability {
             return TaskResult {
                 task_id: task.id,
@@ -306,21 +331,26 @@ fn execute_task_with_failure_simulation(
         }
     }
 
+    // Execute the real operator
     execute_task(task, cache)
 }
 
+// Execute one logical task: load input, run operator, write output and prepare TaskResult
 fn execute_task(task: &Task, cache: &SharedCache) -> TaskResult {
+    // Default output path for non-shuffle_write operators
     let output_path =
         operators::output_path(&task.job_id.to_string(), &task.node_id, task.partition_id);
 
     match operators::execute_operator(task, cache) {
         Ok(result) => {
+            // Cache partition result under job:node:partition key
             let cache_key = format!("{}:{}:{}", task.job_id, task.node_id, task.partition_id);
             cache
                 .lock()
                 .unwrap()
                 .put(cache_key, result.partition.clone());
 
+            // For most operators, persist to disk; shuffle_write handles its own persistence
             if task.op != "shuffle_write" {
                 if let Err(e) = operators::write_partition(&output_path, &result.partition) {
                     return TaskResult {
@@ -336,6 +366,7 @@ fn execute_task(task: &Task, cache: &SharedCache) -> TaskResult {
                 }
             }
 
+            // Successful task result
             TaskResult {
                 task_id: task.id,
                 job_id: task.job_id,
@@ -347,6 +378,7 @@ fn execute_task(task: &Task, cache: &SharedCache) -> TaskResult {
                 shuffle_outputs: result.shuffle_outputs,
             }
         }
+        // Operator execution failed (logical or I/O error)
         Err(e) => TaskResult {
             task_id: task.id,
             job_id: task.job_id,

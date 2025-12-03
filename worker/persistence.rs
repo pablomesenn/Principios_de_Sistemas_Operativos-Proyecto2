@@ -1,4 +1,3 @@
-// master/src/persistence.rs
 // Persistencia del estado de jobs a archivo JSON
 
 use common::{JobInfo, JobStatus};
@@ -37,50 +36,46 @@ impl PersistedState {
             last_saved: current_timestamp(),
         }
     }
-    
+
     /// Cargar estado desde disco
     pub fn load() -> Self {
         if !Path::new(JOBS_FILE).exists() {
             println!("[PERSISTENCE] No hay estado previo, iniciando vacío");
             return Self::new();
         }
-        
+
         match fs::read_to_string(JOBS_FILE) {
-            Ok(content) => {
-                match serde_json::from_str(&content) {
-                    Ok(state) => {
-                        println!("[PERSISTENCE] Estado cargado desde {}", JOBS_FILE);
-                        state
-                    }
-                    Err(e) => {
-                        println!("[PERSISTENCE] Error parseando estado: {}", e);
-                        Self::new()
-                    }
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(state) => {
+                    println!("[PERSISTENCE] Estado cargado desde {}", JOBS_FILE);
+                    state
                 }
-            }
+                Err(e) => {
+                    println!("[PERSISTENCE] Error parseando estado: {}", e);
+                    Self::new()
+                }
+            },
             Err(e) => {
                 println!("[PERSISTENCE] Error leyendo estado: {}", e);
                 Self::new()
             }
         }
     }
-    
+
     /// Guardar estado a disco
     pub fn save(&mut self) -> Result<(), String> {
-        fs::create_dir_all(STATE_DIR)
-            .map_err(|e| format!("Error creando directorio: {}", e))?;
-        
+        fs::create_dir_all(STATE_DIR).map_err(|e| format!("Error creando directorio: {}", e))?;
+
         self.last_saved = current_timestamp();
-        
-        let content = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("Error serializando: {}", e))?;
-        
-        fs::write(JOBS_FILE, content)
-            .map_err(|e| format!("Error escribiendo: {}", e))?;
-        
+
+        let content =
+            serde_json::to_string_pretty(self).map_err(|e| format!("Error serializando: {}", e))?;
+
+        fs::write(JOBS_FILE, content).map_err(|e| format!("Error escribiendo: {}", e))?;
+
         Ok(())
     }
-    
+
     /// Actualizar job en estado persistido
     pub fn update_job(&mut self, job: &JobInfo) {
         let status_str = match &job.status {
@@ -89,23 +84,24 @@ impl PersistedState {
             JobStatus::Succeeded => "Succeeded".to_string(),
             JobStatus::Failed(msg) => format!("Failed: {}", msg),
         };
-        
+
         let persisted = PersistedJob {
             id: job.id.to_string(),
             name: job.request.name.clone(),
             status: status_str,
             progress: job.progress,
             parallelism: job.request.parallelism,
-            created_at: self.jobs
+            created_at: self
+                .jobs
                 .get(&job.id.to_string())
                 .map(|j| j.created_at)
                 .unwrap_or_else(current_timestamp),
             updated_at: current_timestamp(),
         };
-        
+
         self.jobs.insert(job.id.to_string(), persisted);
     }
-    
+
     /// Obtener jobs que estaban en Running (para posible recuperación)
     pub fn get_incomplete_jobs(&self) -> Vec<&PersistedJob> {
         self.jobs
@@ -136,26 +132,29 @@ pub struct PersistenceManager {
 impl PersistenceManager {
     pub fn new() -> Self {
         let state = PersistedState::load();
-        
+
         // Reportar jobs incompletos
         let incomplete = state.get_incomplete_jobs();
         if !incomplete.is_empty() {
-            println!("[PERSISTENCE] {} jobs incompletos encontrados del estado anterior:", incomplete.len());
+            println!(
+                "[PERSISTENCE] {} jobs incompletos encontrados del estado anterior:",
+                incomplete.len()
+            );
             for job in &incomplete {
                 println!("  - {} ({}) - {}", job.name, job.id, job.status);
             }
         }
-        
+
         Self {
             state: Arc::new(Mutex::new(state)),
         }
     }
-    
+
     /// Actualizar y guardar job
     pub fn save_job(&self, job: &JobInfo) {
         let mut state = self.state.lock().unwrap();
         state.update_job(job);
-        
+
         // Guardar solo si pasó suficiente tiempo
         let now = current_timestamp();
         if now - state.last_saved >= SAVE_INTERVAL_SECS {
@@ -164,7 +163,7 @@ impl PersistenceManager {
             }
         }
     }
-    
+
     /// Forzar guardado inmediato
     pub fn flush(&self) {
         let mut state = self.state.lock().unwrap();
@@ -174,7 +173,7 @@ impl PersistenceManager {
             println!("[PERSISTENCE] Estado guardado a disco");
         }
     }
-    
+
     /// Obtener estado actual
     pub fn get_state(&self) -> PersistedState {
         self.state.lock().unwrap().clone()

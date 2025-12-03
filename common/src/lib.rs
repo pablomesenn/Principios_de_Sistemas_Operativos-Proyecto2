@@ -1,14 +1,12 @@
-// common/src/lib.rs
-
 pub mod logging;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// Re-exportar logging
+// Re-export logging
 pub use logging::{LogEntry, LogLevel, Logger};
 
-// ============ Registro de datos ============
+// ============ Register of data ============
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Record {

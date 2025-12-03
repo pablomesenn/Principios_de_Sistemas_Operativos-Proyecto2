@@ -1,5 +1,3 @@
-// client/src/main.rs
-
 use clap::{Parser, Subcommand};
 use common::{Dag, DagNode, JobInfo, JobRequest, TaskResult};
 use reqwest::Client;
@@ -33,7 +31,7 @@ enum MetricsMode {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Enviar job wordcount
+    /// Enviar job -> wordcount
     Submit {
         #[arg(short, long, default_value = "wordcount")]
         name: String,
@@ -42,7 +40,7 @@ enum Commands {
         #[arg(short, long, default_value = "data/input.csv")]
         input: String,
     },
-    /// Enviar job con join
+    /// Enviar job -> join
     SubmitJoin {
         #[arg(short, long, default_value = "join-job")]
         name: String,
@@ -71,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Conectando a master: {}", cli.master);
 
+    // Match the command that is being executed
     match cli.command {
         Commands::Submit {
             name,
@@ -123,7 +122,6 @@ async fn main() -> anyhow::Result<()> {
             }
         },
     }
-
     Ok(())
 }
 
@@ -181,11 +179,13 @@ async fn get_status(client: &Client, master: &str, id: Uuid) -> anyhow::Result<(
 }
 
 async fn get_results(client: &Client, master: &str, id: Uuid) -> anyhow::Result<()> {
+    // Get the response
     let res = client
         .get(format!("{}/api/v1/jobs/{}/results", master, id))
         .send()
         .await?;
 
+    // Check if the request was successful
     if res.status().is_success() {
         let results: Vec<TaskResult> = res.json().await?;
         println!("Resultados ({} tareas completadas):", results.len());
@@ -201,6 +201,7 @@ async fn get_results(client: &Client, master: &str, id: Uuid) -> anyhow::Result<
     Ok(())
 }
 
+// Build DAG for wordcount job
 fn create_wordcount_dag(input_path: &str, partitions: u32) -> Dag {
     Dag {
         nodes: vec![
@@ -249,6 +250,7 @@ fn create_wordcount_dag(input_path: &str, partitions: u32) -> Dag {
     }
 }
 
+// Build DAG for joining job
 fn create_join_dag(sales_path: &str, products_path: &str, partitions: u32) -> Dag {
     Dag {
         nodes: vec![

@@ -1,10 +1,10 @@
-# Dockerfile para Mini-Spark
-# Multi-stage build para optimizar tamaño de imagen
+# Dockerfile for Mini-Spark
+# Multi-stage build for optimizing image size
 
-# ============ Etapa de compilación ============
+# ============ Compilation Stage ============
 FROM rust:1.83-slim-bookworm AS builder
 
-# Instalar dependencias de compilación
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
@@ -12,34 +12,34 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copiar archivos de configuración primero (para cache de dependencias)
+# First copy configuration files (for caching dependencies)
 COPY Cargo.toml Cargo.lock* ./
 COPY master/Cargo.toml ./master/
 COPY worker/Cargo.toml ./worker/
 COPY client/Cargo.toml ./client/
 COPY common/Cargo.toml ./common/
 
-# Crear archivos dummy para compilar dependencias
+# Create dummy files for compiling dependencies
 RUN mkdir -p master/src worker/src client/src common/src && \
     echo "fn main() {}" > master/src/main.rs && \
     echo "fn main() {}" > worker/src/main.rs && \
     echo "fn main() {}" > client/src/main.rs && \
     echo "" > common/src/lib.rs
 
-# Compilar dependencias (se cachean)
+# Compile dependencies (cached)
 RUN cargo build --release || true
 
-# Copiar código fuente real
+# Copy real source code
 COPY master/src ./master/src
 COPY worker/src ./worker/src
 COPY client/src ./client/src
 COPY common/src ./common/src
 
-# Recompilar con código real
+# Recompile with real code
 RUN touch master/src/main.rs worker/src/main.rs client/src/main.rs common/src/lib.rs && \
     cargo build --release
 
-# ============ Imagen del Master ============
+# ============ Master Image ============
 FROM debian:bookworm-slim AS master
 
 RUN apt-get update && apt-get install -y \
@@ -49,7 +49,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Crear directorios necesarios
+# Create necessary directories
 RUN mkdir -p /tmp/minispark/state /tmp/minispark/spill /app/data
 
 COPY --from=builder /app/target/release/master /app/master
@@ -60,7 +60,7 @@ ENV RUST_LOG=info
 
 CMD ["/app/master"]
 
-# ============ Imagen del Worker ============
+# ============ Worker Image ============
 FROM debian:bookworm-slim AS worker
 
 RUN apt-get update && apt-get install -y \
@@ -70,7 +70,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Crear directorios necesarios
+# Create necessary directories
 RUN mkdir -p /tmp/minispark/state /tmp/minispark/spill /app/data
 
 COPY --from=builder /app/target/release/worker /app/worker
@@ -86,7 +86,7 @@ ENV LOG_FORMAT=text
 
 CMD ["/app/worker"]
 
-# ============ Imagen del Cliente ============
+# ============ Client Image ============
 FROM debian:bookworm-slim AS client
 
 RUN apt-get update && apt-get install -y \
@@ -96,7 +96,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Crear directorios necesarios
+# Create necessary directories
 RUN mkdir -p /tmp/minispark /app/data
 
 COPY --from=builder /app/target/release/client /app/client

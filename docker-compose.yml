@@ -1,5 +1,4 @@
 # docker-compose.yml
-# Mini-Spark: Motor de Procesamiento Distribuido
 #
 # Uso:
 #   docker-compose build                    # Compilar imágenes
@@ -118,7 +117,7 @@ services:
     networks:
       - minispark-net
     profiles:
-      - full  # Solo se inicia con: docker-compose --profile full up
+      - full # docker-compose --profile full up
 
   # ============ Worker con fallos simulados (para testing) ============
   worker-flaky:
@@ -143,7 +142,7 @@ services:
     networks:
       - minispark-net
     profiles:
-      - test  # Solo se inicia con: docker-compose --profile test up
+      - test # docker-compose --profile test up
 
   # ============ Cliente CLI ============
   client:
@@ -162,7 +161,7 @@ services:
     networks:
       - minispark-net
     profiles:
-      - tools  # No se inicia automáticamente
+      - tools # Do not initiates automatically
 
 # ============ Redes ============
 networks:

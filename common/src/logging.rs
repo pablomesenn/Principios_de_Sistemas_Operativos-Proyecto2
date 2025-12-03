@@ -1,6 +1,3 @@
-// common/src/logging.rs
-// Logging estructurado con niveles y formato JSON opcional
-
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,7 +60,8 @@ impl LogEntry {
     }
 
     pub fn to_json(&self) -> String {
-        let fields_json: Vec<String> = self.fields
+        let fields_json: Vec<String> = self
+            .fields
             .iter()
             .map(|(k, v)| format!("\"{}\":\"{}\"", k, v.replace('\"', "\\\"")))
             .collect();
@@ -85,25 +83,23 @@ impl LogEntry {
     }
 
     pub fn to_text(&self) -> String {
-        let fields_str: String = self.fields
+        let fields_str: String = self
+            .fields
             .iter()
             .map(|(k, v)| format!(" {}={}", k, v))
             .collect();
 
         format!(
             "[{}] [{}] {}{}",
-            self.level,
-            self.component,
-            self.message,
-            fields_str
+            self.level, self.component, self.message, fields_str
         )
     }
 }
 
-/// Logger con nivel mínimo configurable
+/// Configurable logger
 pub struct Logger {
     component: String,
-    min_level: LogLevel,
+    min_level: LogLevel, // Configurable level of logging
     json_format: bool,
 }
 
@@ -169,7 +165,7 @@ impl Logger {
     }
 }
 
-// Macros para logging más ergonómico
+// Macros for logging more ergonomically
 #[macro_export]
 macro_rules! log_debug {
     ($logger:expr, $msg:expr) => {

@@ -1,6 +1,3 @@
-# .dockerignore
-# Excluir archivos innecesarios del contexto de Docker
-
 # Rust build artifacts
 target/
 Cargo.lock
