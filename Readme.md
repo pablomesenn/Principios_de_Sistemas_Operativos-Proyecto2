@@ -1,5 +1,8 @@
 # Mini-Spark
 
+## Descripción
+#### Autores: Pablo Mesén Alvarado y Luis Urbina Salazar
+
 Mini-Spark es un motor de procesamiento distribuido minimalista, inspirado en Apache Spark, diseñado para experimentar y entender los principios fundamentales del procesamiento distribuido de datos. El proyecto permite ejecutar trabajos distribuidos de ejemplo (word count, join, etc), gestionar tolerancia a fallos, realizar balanceo de carga, cache intermedia y exponer métricas en tiempo real.
 
 ## Tabla de Contenidos
@@ -277,13 +280,3 @@ El sistema cuenta con un conjunto amplio de scripts automáticos y comandos de M
 - Ejecución multinodo y pruebas de integración end-to-end
 
 Todos los tests muestran logs por consola y también se pueden encontrar registros detallados en archivos bajo `scripts/` y otras carpetas de pruebas.
-
----
-
-## Licencia
-
-Este proyecto es open source bajo la licencia MIT.
-
----
-
-**¡Esperamos que disfrutes explorando Mini-Spark y aprendiendo sobre sistemas distribuidos!**
