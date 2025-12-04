@@ -5,18 +5,21 @@
 
 Mini-Spark es un motor de procesamiento distribuido minimalista, inspirado en Apache Spark, diseñado para experimentar y entender los principios fundamentales del procesamiento distribuido de datos. El proyecto permite ejecutar trabajos distribuidos de ejemplo (word count, join, etc), gestionar tolerancia a fallos, realizar balanceo de carga, cache intermedia y exponer métricas en tiempo real.
 
+**Este proyecto implementa la Ruta A: Batch DAG** del curso de Principios de Sistemas Operativos del TEC Cartago.
+
 ## Tabla de Contenidos
 - [Características principales](#características-principales)
 - [Estructura del proyecto](#estructura-del-proyecto)
 - [Requisitos](#requisitos)
+- [Resultados del Benchmark](#resultados-del-benchmark)
 - [Guía rápida: Ejecución local](#guía-rápida-ejecución-local)
 - [Guía rápida: Ejecución con Docker](#guía-rápida-ejecución-con-docker)
 - [Documentación completa del Makefile](#documentación-completa-del-makefile)
 - [Descripción de los scripts](#descripción-de-los-scripts)
 - [Generación de datos de prueba](#generación-de-datos-de-prueba)
 - [Endpoints de Métricas](#endpoints-de-métricas)
+- [Arquitectura General](#arquitectura-general)
 - [Tests incluidos](#tests-incluidos)
-- [Licencia](#licencia)
 
 ---
 
@@ -25,8 +28,9 @@ Mini-Spark es un motor de procesamiento distribuido minimalista, inspirado en Ap
 - **Arquitectura distribuida**: Separación clara de procesos Master, Worker y Cliente.
 - **Tolerancia a fallos**: Detección y recuperación automática ante la caída de workers.
 - **Métricas en tiempo real**: Exposición vía endpoints HTTP/JSON del estado de jobs, etapas y workers.
-- **Balanceo de carga**: Distribución automática del trabajo entre los workers disponibles.
-- **Soporte de cache**: Reutilización de resultados intermedios en los workers.
+- **Balanceo de carga**: Distribución automática del trabajo entre los workers disponibles (round-robin + load-aware).
+- **Soporte de cache**: Reutilización de resultados intermedios en los workers con spill a disco.
+- **Planificador inteligente**: Round-robin con awareness de carga para distribuir tareas equitativamente.
 - **Ejemplo de jobs**: WordCount, Join, etc, sobre archivos CSV.
 - **Extensible y didáctico**: Fácil de entender y modificar, ideal para aprendizaje.
 
@@ -37,6 +41,7 @@ Mini-Spark es un motor de procesamiento distribuido minimalista, inspirado en Ap
 ```
 .
 ├── Dockerfile             # Imágenes (Master, Worker, Client)
+├── docker-compose.yml     # Orquestación de servicios
 ├── Makefile               # Comandos build, test, datos, métricas, Docker, etc.
 ├── scripts/               # Bash scripts para testear, crear datos, automatizar pruebas
 ├── data/                  # Carpeta de datos de entrada/salida
@@ -44,8 +49,7 @@ Mini-Spark es un motor de procesamiento distribuido minimalista, inspirado en Ap
 ├── master/                # Binario de proceso Master
 ├── worker/                # Binario de proceso Worker
 ├── client/                # Binario para enviar jobs
-├── tests/                 # Pruebas automáticas y de integración
-└── Readme.md              # Documentación principal
+└── README.md              # Documentación principal
 ```
 
 ---
@@ -53,9 +57,41 @@ Mini-Spark es un motor de procesamiento distribuido minimalista, inspirado en Ap
 ## Requisitos
 
 - **Rust** >= 1.70  
-- **Docker** (para despliegue del clúster)  
-- Herramientas GNU/Linux (`bash`, `curl`)  
+- **Docker** y **Docker Compose** (para despliegue del clúster)  
+- Herramientas GNU/Linux (`bash`, `curl`, `python3`)  
 - Recomendado: Linux o WSL2 sobre Windows
+
+---
+
+## Resultados del Benchmark
+
+### Benchmark Oficial: 1,000,000 registros (WordCount)
+
+**Entorno:**
+- Dataset: 1,000,000 líneas de texto
+- Operación: WordCount (flat_map → map → reduce)
+- Paralelismo: 6 particiones
+- Workers: 2 (en Docker)
+- Master: Coordinación y planificación
+
+**Resultados:**
+- **Tiempo total:** 17,021 ms (17 segundos)
+- **Throughput:** 58,754.40 registros/segundo (entrada)
+- **Throughput interno:** 1,320,790.23 registros/segundo (picos internos)
+- **Registros procesados:** 17,170,273 (incluye amplificaciones por operadores)
+- **Tareas ejecutadas:** 30 tareas exitosas (sin reintentos)
+- **Etapas completadas:** 5 (read → flatmap → map → shuffle_write → reduce)
+
+**Desglose por etapa:**
+| Etapa | Duración | Tareas | Registros procesados |
+|-------|----------|--------|----------------------|
+| read | ~2s | 6 | 451,849 |
+| flatmap | ~2s | 6 | 5,422,188 |
+| map | ~3s | 6 | 5,422,188 |
+| shuffle_write | ~2s | 6 | 5,422,188 |
+| reduce | ~1s | 6 | 451,860 |
+
+**Conclusión:** El sistema procesa **~59K registros/segundo** en modo entrada, demostrando escalabilidad y eficiencia en la distribución de trabajo entre múltiples workers.
 
 ---
 
@@ -77,13 +113,11 @@ Mini-Spark es un motor de procesamiento distribuido minimalista, inspirado en Ap
    ```sh
    make run-worker
    # O en otros puertos:
-   WORKER_PORT=10001 make run-worker
+   WORKER_PORT=9001 make run-worker
    ```
 5. **Enviar un job desde el cliente:**
    ```sh
    make run-client-submit
-   # También puedes correr jobs concretos:
-   ./target/release/client run wordcount data/input.csv
    ```
 
 ---
@@ -98,7 +132,7 @@ Mini-Spark es un motor de procesamiento distribuido minimalista, inspirado en Ap
    ```sh
    make docker-demo
    ```
-   Esto ejecuta un procesamiento distribuido de ejemplo y muestra el uso de métricas.
+   Esto ejecuta un procesamiento distribuido de ejemplo con 1M registros y muestra métricas en tiempo real.
 
 3. **Detener el clúster:**
    ```sh
@@ -109,174 +143,245 @@ Mini-Spark es un motor de procesamiento distribuido minimalista, inspirado en Ap
 
 ## Documentación completa del Makefile
 
-El Makefile es el corazón de la automatización en Mini-Spark. A continuación se detallan todos los comandos disponibles y su propósito:
+El Makefile es el corazón de la automatización en Mini-Spark. A continuación se detallan todos los comandos disponibles:
 
 ### Construcción y limpieza
 
-- **`make build`**  
-  Compila todos los binarios (master, worker, client) en modo release.
-- **`make clean`**  
-  Elimina binarios compilados y datos temporales.
+- **`make build`** - Compila todos los binarios en modo release
+- **`make build-debug`** - Compila en modo debug con símbolos
+- **`make clean`** - Elimina binarios compilados
 
 ### Ejecución local de servicios
 
-- **`make run-master`**  
-  Arranca el proceso master localmente en el puerto 8080.
-- **`make run-worker`**  
-  Inicia un worker local en el puerto definido por la variable `WORKER_PORT` (por defecto 10000):  
-  ```sh
-  WORKER_PORT=10001 make run-worker
-  ```
-  Puedes lanzar múltiples workers en diferentes terminales usando distintos puertos.
-- **`make run-client`**  
-  Lanza el binario del cliente para uso interactivo.
-- **`make run-client-submit`**  
-  Envía automáticamente un trabajo de ejemplo desde el cliente al master.
-- **`make run-client-wordcount`**  
-  Ejecuta un job WordCount concreto.
-- **`make run-client-join`**  
-  Ejecuta un job Join concreto.
+- **`make run-master`** - Arranca el master en puerto 8080
+- **`make run-worker`** - Inicia un worker (configurable con WORKER_PORT, WORKER_THREADS, CACHE_MAX_MB)
+- **`make run-client-submit`** - Envía un job de wordcount
+- **`make run-client-join`** - Envía un job de join
+- **`make run-client-status`** - Consulta estado de un job (requiere ID)
 
 ### Generación de datos de prueba
 
-- **`make create-test-data`**  
-  Genera datasets de prueba pequeños en `data/`.
-- **`make create-large-data`**  
-  Crea un archivo de datos grande (~10,000 líneas).
-- **`make create-1m-data`**  
-  Genera un dataset de benchmarking de 1 millón de líneas.
-- **`make create-join-data`**  
-  Genera archivos especiales para pruebas de operaciones JOIN.
+- **`make create-test-data`** - Genera datos pequeños (~10 líneas)
+- **`make create-large-data`** - Genera datos medianos (~10,000 líneas)
+- **`make create-1m-data`** - Genera dataset de benchmark (1M líneas)
+- **`make create-join-data`** - Genera datos para pruebas de JOIN
 
 ### Testing y métricas
 
-- **`make test`**  
-  Ejecuta los tests unitarios y de integración de todos los crates.
-- **`make test-metrics`**  
-  Realiza pruebas automáticas de todos los endpoints de métricas del sistema mediante scripts.
-- **`make test-fault-tolerance`**  
-  Test de tolerancia a fallos: prueba que el sistema se recupere ante caídas de workers.
-- **`make test-cache`**  
-  Prueba el funcionamiento del cache de workers.
-- **`make test-load-balance`**  
-  Verifica el balanceo de carga entre workers.
+- **`make test`** - Ejecuta tests unitarios
+- **`make test-metrics`** - Prueba endpoints de métricas
+- **`make test-fault-tolerance`** - Simula caída de workers y recuperación
+- **`make test-cache`** - Verifica funcionamiento del cache
+- **`make test-load-balancing`** - Verifica distribución de carga
 
-### Orquestación y Docker
+### Consulta de métricas (local)
 
-- **`make docker-build`**  
-  Compila el proyecto y construye las imágenes de Docker para master, worker y client.
-- **`make docker-up`**  
-  Despliega un clúster de servicios (master, workers y client) usando Docker Compose.
-- **`make docker-demo`**  
-  Lanza el clúster y ejecuta automáticamente una demo end-to-end con métricas.
-- **`make docker-test`**  
-  Lanza pruebas de tolerancia a fallos dentro de Docker.
-- **`make docker-down`**  
-  Detiene y elimina los contenedores y recursos Docker usados por Mini-Spark.
+- **`make metrics-system`** - Métricas del sistema
+- **`make metrics-jobs`** - Métricas de todos los jobs
+- **`make metrics-failures`** - Contadores de fallos
+- **`make metrics-job`** - Métricas de un job específico (ID variable)
 
-### Ayuda
+### Docker
 
-- **`make help`**  
-  Muestra todos los comandos disponibles y su descripción.
+- **`make docker-build`** - Compila imágenes Docker
+- **`make docker-up`** - Despliega cluster (master + 2 workers)
+- **`make docker-demo`** - Demo automática con 1M registros
+- **`make docker-test`** - Test de tolerancia a fallos en Docker
+- **`make docker-down`** - Detiene y elimina contenedores
+- **`make docker-logs`** - Ver logs en tiempo real
 
 ---
 
 ## Descripción de los scripts
 
-El directorio `scripts/` contiene utilidades Bash para testing, generación de datos y otras tareas automatizadas clave.
+El directorio `scripts/` contiene utilidades para testing y automatización:
 
-### Scripts principales:
-
-- **`create_test_data.sh`**  
-  Genera conjuntos de datos pequeños (`data/input.csv`, etc) para pruebas rápidas.
-- **`create_large_data.sh`**  
-  Crea archivos de datos más grandes o personalizados para tests de estrés.
-- **`create_1m_data.sh`**  
-  Genera el dataset de 1 millón de líneas para benchmarking (`data/benchmark_1m.csv`).
-- **`create_join_data.sh`**  
-  Crea archivos especiales necesarios para pruebas de JOIN entre datasets.
-- **`test_metrics.sh`**  
-  Script automatizado que prueba todos los endpoints de métricas (`/api/v1/metrics/system`, `/api/v1/metrics/jobs`, etc). Muestra resultados y los formatea en JSON.  
-  Incluye pruebas de:
-  - Métricas del sistema y trabajos
-  - Estadísticas por etapa
-  - Métricas individuales por worker
-  - Resumen de endpoints y ejemplo de consulta vía `curl`
-- **`test_fault_tolerance.sh`**  
-  Simula la caída y recuperación de workers, verificando la tolerancia a fallos del sistema.
-- **`test_cache.sh`**  
-  Verifica el funcionamiento y efectividad del cache de los workers.
-- **`test_load_balance.sh`**  
-  Automatiza la verificación del reparto de trabajos entre múltiples workers.
-- **`run_demo.sh`**  
-  Arranca y coordina todos los componentes para correr una demo end-to-end.
-- **Otros scripts**: utilidades menores de monitoreo, limpieza, inicialización, logs de pruebas, etc.
-
-**Nota:** La mayoría de los scripts pueden ejecutarse directamente o vía los comandos correspondientes del Makefile.
+- **`docker-demo.sh`** - Demo completa del clúster con múltiples etapas
+- **`docker-fault-test.sh`** - Mata un worker durante ejecución para probar recuperación
+- **`test_metrics.sh`** - Verifica todos los endpoints de métricas
+- **`test_fault_tolerance.sh`** - Prueba reintentos y replanificación
+- **`test_cache.sh`** - Verifica cache en memoria y spill a disco
+- **`test_load_balancing.sh`** - Verifica distribución de trabajo
+- **`test_parallel_tasks.sh`** - Prueba ejecución paralela en workers
+- **`test_round_robin.sh`** - Verifica algoritmo de scheduling
+- **`benchmark_1m.sh`** - Benchmark oficial de 1M registros
 
 ---
 
 ## Generación de datos de prueba
 
-Puedes crear datasets en la carpeta `data/` para probar funcionalidad, performance o casos edge con los siguientes comandos:
+```sh
+# Pequeño (rápido para desarrollo)
+make create-test-data
 
-- Crear datos mínimos para pruebas básicas:
-  ```sh
-  make create-test-data
-  ```
-- Crear un dataset grande (~10,000 líneas):
-  ```sh
-  make create-large-data
-  ```
-- Crear un gran dataset de benchmark (1 millón de líneas):
-  ```sh
-  make create-1m-data
-  ```
-- Crear datasets para pruebas de join:
-  ```sh
-  make create-join-data
-  ```
+# Mediano (~10K líneas)
+make create-large-data
 
-Todos los archivos generados aparecen automáticamente en la carpeta `data/`.
+# Grande - Benchmark oficial (1M líneas)
+make create-1m-data
+
+# Para pruebas de JOIN
+make create-join-data
+```
 
 ---
 
 ## Endpoints de Métricas
 
-Mini-Spark expone endpoints HTTP REST para monitoreo interno y benchmarking.
+**Master (puerto 8080):**
 
-**En el Master (puerto 8080):**
-
-| Endpoint                                | Descripción                       |
-|------------------------------------------|-----------------------------------|
-| `/api/v1/metrics/system`                 | Métricas generales del sistema    |
-| `/api/v1/metrics/jobs`                   | Métricas de todos los jobs        |
-| `/api/v1/metrics/failures`               | Conteo de fallos                  |
-| `/api/v1/jobs/{job_id}/metrics`          | Métricas detalladas de un job     |
-| `/api/v1/jobs/{job_id}/stages`           | Estadísticas por etapa del job    |
-| `/api/v1/state`                          | Estado persistente de los jobs    |
-
-**En cada Worker (por defecto puerto 10000):**
-
-| Endpoint         | Descripción                    |
-|------------------|-------------------------------|
-| `/metrics`       | Métricas del worker           |
-
-**Consulta rápida:**
 ```sh
-curl -s http://127.0.0.1:8080/api/v1/metrics/system | python3 -m json.tool
+# Métricas generales del sistema
+curl http://127.0.0.1:8080/api/v1/metrics/system
+
+# Métricas de todos los jobs
+curl http://127.0.0.1:8080/api/v1/metrics/jobs
+
+# Conteo de fallos
+curl http://127.0.0.1:8080/api/v1/metrics/failures
+
+# Métricas detalladas de un job específico
+curl http://127.0.0.1:8080/api/v1/jobs/{JOB_ID}/metrics
+
+# Estadísticas por etapa (DAG nodes)
+curl http://127.0.0.1:8080/api/v1/jobs/{JOB_ID}/stages
+
+# Estado persistente
+curl http://127.0.0.1:8080/api/v1/state
+```
+
+**Worker (puerto 10000 + WORKER_PORT):**
+
+```sh
+# Métricas del worker específico
+curl http://127.0.0.1:10000/metrics
+```
+
+---
+
+## Arquitectura General
+
+### Componentes principales
+
+**1. Master (Coordinador)**
+- Escucha en puerto 8080
+- Registra workers mediante heartbeat
+- Recibe jobs con DAG (Directed Acyclic Graph)
+- Convierte DAG en tareas físicas
+- Inserta etapas de shuffle automáticamente para reduce_by_key
+- Distribuye tareas a workers con round-robin + load awareness
+- Detecta fallos de workers (timeout de heartbeat)
+- Replanifica tareas fallidas automáticamente
+- Expone métricas vía endpoints REST
+- Persiste estado de jobs a disco (/tmp/minispark/state)
+
+**2. Workers**
+- Escuchan en puertos configurables (9000, 9001, etc)
+- Pool de hilos configurables (WORKER_THREADS)
+- Poll continuo al master pidiendo tareas
+- Ejecutan operadores (map, filter, flat_map, reduce_by_key, etc)
+- Cache en memoria con spill a disco automático (configurable)
+- Reportan resultados al master
+- Exponen métricas locales en puerto WORKER_PORT + 1000
+
+**3. Cliente**
+- CLI para enviar jobs
+- Consulta estado y progreso
+- Descarga resultados
+- Obtiene métricas del sistema
+
+### Flujo de datos (WordCount)
+
+```
+CSV Input (1M registros)
+        ↓
+    [read_csv] - lectura particionada
+        ↓
+   [flat_map] - split_words (1 línea → N palabras)
+        ↓
+    [map] - pair_with_one (palabra → (palabra, "1"))
+        ↓
+[shuffle_write] - hash partitioning por clave
+        ↓
+ [shuffle_read] - agrupa claves
+        ↓
+   [reduce_by_key] - sum por palabra
+        ↓
+    Resultados (palabras únicas con conteos)
+```
+
+### Tolerancia a fallos
+
+- **Heartbeat**: Cada 2 segundos cada worker reporta al master
+- **Timeout**: Si no hay heartbeat en 10 segundos, worker se marca DOWN
+- **Replanificación**: Tareas del worker DOWN se reencolan
+- **Reintentos**: Máximo 3 intentos por tarea
+- **Idempotencia**: Se registra el attempt para evitar duplicados
+
+### Scheduling (Round-Robin + Load Awareness)
+
+```
+Workers: [W1(load=2), W2(load=1), W3(load=3)]
+MaxDiff: 2
+
+get_task():
+  1. Calcula min_load entre workers UP
+  2. Round-robin sobre workers
+  3. Asigna a worker si: active_tasks <= min_load + max_load_diff
+  4. Si está sobrecargado, intenta siguiente
 ```
 
 ---
 
 ## Tests incluidos
 
-El sistema cuenta con un conjunto amplio de scripts automáticos y comandos de Makefile para:
+Todos pueden ejecutarse con `make`:
 
-- Tolerancia a fallos (`make test-fault-tolerance`)
-- Balanceo de carga entre workers
-- Cache intermedia en los workers
-- Verificación de endpoints de métricas (`make test-metrics`)
-- Ejecución multinodo y pruebas de integración end-to-end
+```sh
+make test                    # Tests unitarios
+make test-metrics            # Endpoints de métricas
+make test-fault-tolerance    # Caída y recuperación de workers
+make test-cache              # Cache en memoria y spill
+make test-load-balancing     # Distribución de trabajo
+make test-parallel-tasks     # Paralelismo en workers
+make test-round-robin        # Algoritmo de scheduling
+```
 
-Todos los tests muestran logs por consola y también se pueden encontrar registros detallados en archivos bajo `scripts/` y otras carpetas de pruebas.
+---
+
+## Pasos para reproducir el benchmark de 1M registros
+
+```bash
+# 1. Build
+make build
+
+# 2. Crear dataset (si no existe)
+make create-1m-data
+
+# 3. Opción A: Docker (recomendado)
+make docker-demo
+
+# Opción B: Local
+# Terminal 1:
+make run-master
+
+# Terminal 2:
+CACHE_MAX_MB=128 make run-worker
+
+# Terminal 3:
+./target/release/client submit --input data/benchmark_1m.csv --parallelism 6
+
+# Ver resultados
+curl http://127.0.0.1:8080/api/v1/metrics/jobs | python3 -m json.tool
+```
+
+---
+
+## Declaración de IA
+
+Este proyecto ha utilizado herramientas de inteligencia artificial como Claude, ChatGPT y Cursor como apoyo para la generación, corrección y mejora del código, documentación y scripts vinculados. Estas soluciones se emplearon como asistentes de programación y redacción técnica bajo supervisión humana.
+
+
+## Licencia
+
+Proyecto académico para el curso de Principios de Sistemas Operativos del TEC Cartago.

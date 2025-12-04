@@ -1,0 +1,25 @@
+=============================================
+Mini-Spark Benchmark Report - 1M Records
+=============================================
+
+ENVIRONMENT:
+  Dataset: 1,000,000 lines of text
+  Parallelism: 6 partitions
+  Workers: 2 (docker-compose)
+  Operation: WordCount (flat_map -> map -> reduce)
+
+RESULTS:
+  Total Time: 17021 ms (17 seconds)
+  Throughput: 58754.40 records/second
+  Job ID: 1de6e656-e7dc-4200-be27-2590db122b46
+  Status: Succeeded
+
+METRICS FILES:
+  - Job metrics: results/benchmark_1m_metrics.json
+  - System metrics: results/system_metrics.json
+  - Stage timeline: results/benchmark_1m_stages.json
+  - Full report: results/benchmark_1m.json
+
+Command to reproduce:
+  bash scripts/benchmark_1m.sh
+

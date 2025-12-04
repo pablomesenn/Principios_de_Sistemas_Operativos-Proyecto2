@@ -973,28 +973,25 @@ fn check_node_completion(state: &AppState, task: &Task) {
     let completed = state.completed_tasks.lock().unwrap();
     let total_partitions = task.total_partitions;
 
-    // Count partitions completed for this node based on output paths
-    let completed_partitions: u32 = completed
-        .values()
-        .filter(|r| r.job_id == task.job_id && r.success)
-        .filter(|r| {
-            r.output_path
-                .as_ref()
-                .and_then(|p| extract_node_id_from_path(p, &task.job_id.to_string()))
-                .as_deref()
-                == Some(&task.node_id)
-        })
-        .count() as u32;
-
-    // For shuffle_write, completion logic is different: each logical partition fan-outs into multiple shuffle files
-    let completed_partitions = if task.op == "shuffle_write" {
+    // Corrected completion counting logic for shuffle_write and normal nodes
+    let completed_partitions: u32 = if task.op == "shuffle_write" {
         completed
             .values()
             .filter(|r| r.job_id == task.job_id && r.success && !r.shuffle_outputs.is_empty())
             .count() as u32
-            / task.total_partitions.max(1)
+        // NO DIVIDIR - solo contar tasks completadas
     } else {
-        completed_partitions
+        completed
+            .values()
+            .filter(|r| r.job_id == task.job_id && r.success)
+            .filter(|r| {
+                r.output_path
+                    .as_ref()
+                    .and_then(|p| extract_node_id_from_path(p, &task.job_id.to_string()))
+                    .as_deref()
+                    == Some(&task.node_id)
+            })
+            .count() as u32
     };
 
     drop(completed);

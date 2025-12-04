@@ -1,0 +1,13 @@
+{
+  "job_id": "1de6e656-e7dc-4200-be27-2590db122b46",
+  "duration_ms": 17021,
+  "duration_sec": 17,
+  "throughput_records_per_sec": 58754.40,
+  "total_records": 1000000,
+  "parallelism": 6,
+  "workers": 2,
+  "timestamp": "2025-12-04T02:40:49Z",
+  "system_metrics": {"jobs_total":1,"jobs_running":0,"workers_up":2,"workers_total":2,"tasks_queued":0,"tasks_running":0,"worker_loads":{"4092ad26-cce6-4ae1-9a51-2e6c65745b58":0,"adf0cd3d-2c07-42fd-8bea-3e1d407095d8":0}},
+  "job_metrics": {"job_id":"1de6e656-e7dc-4200-be27-2590db122b46","name":"wordcount","status":"Completed","start_time":1764816033,"end_time":1764816046,"duration_ms":13000,"total_tasks":30,"completed_tasks":30,"failed_tasks":0,"total_records":17170273,"stages_completed":5,"total_stages":5,"throughput_records_per_sec":1320790.2307692308},
+  "stage_timeline": [{"node_id":"reduce","start_time":1764816045,"end_time":1764816046,"tasks_total":6,"tasks_completed":6,"records_processed":451860},{"node_id":"read","start_time":1764816036,"end_time":1764816038,"tasks_total":6,"tasks_completed":6,"records_processed":451849},{"node_id":"flatmap","start_time":1764816038,"end_time":1764816040,"tasks_total":6,"tasks_completed":6,"records_processed":5422188},{"node_id":"map","start_time":1764816040,"end_time":1764816043,"tasks_total":6,"tasks_completed":6,"records_processed":5422188},{"node_id":"map_shuffle_write","start_time":1764816043,"end_time":1764816045,"tasks_total":6,"tasks_completed":6,"records_processed":5422188}]
+}
